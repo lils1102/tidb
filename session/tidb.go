@@ -31,11 +31,11 @@ import (
 	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/config"
 	"github.com/pingcap/tidb/domain"
+	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/executor"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/variable"
-	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util"
 	"github.com/pingcap/tidb/util/chunk"
 	"github.com/pingcap/tidb/util/logutil"
@@ -117,6 +117,13 @@ var (
 	// statsLease is the time for reload stats table.
 	statsLease = int64(3 * time.Second)
 )
+
+// ResetStoreForWithTiKVTest is only used in the test code.
+// TODO: Remove domap and storeBootstrapped. Use store.SetOption() to do it.
+func ResetStoreForWithTiKVTest(store kv.Storage) {
+	domap.Delete(store)
+	unsetStoreBootstrapped(store.UUID())
+}
 
 func setStoreBootstrapped(storeUUID string) {
 	storeBootstrappedLock.Lock()
@@ -243,6 +250,13 @@ func runStmt(ctx context.Context, sctx sessionctx.Context, s sqlexec.Statement) 
 		defer span1.Finish()
 		ctx = opentracing.ContextWithSpan(ctx, span1)
 	}
+	sctx.SetValue(sessionctx.QueryString, s.OriginText())
+	if _, ok := s.(*executor.ExecStmt).StmtNode.(ast.DDLNode); ok {
+		sctx.SetValue(sessionctx.LastExecuteDDL, true)
+	} else {
+		sctx.ClearValue(sessionctx.LastExecuteDDL)
+	}
+
 	se := sctx.(*session)
 	sessVars := se.GetSessionVars()
 	// Save origTxnCtx here to avoid it reset in the transaction retry.
@@ -251,11 +265,7 @@ func runStmt(ctx context.Context, sctx sessionctx.Context, s sqlexec.Statement) 
 		// If it is not a select statement, we record its slow log here,
 		// then it could include the transaction commit time.
 		if rs == nil {
-			// `LowSlowQuery` and `SummaryStmt` must be called before recording `PrevStmt`.
-			s.(*executor.ExecStmt).LogSlowQuery(origTxnCtx.StartTS, err == nil, false)
-			s.(*executor.ExecStmt).SummaryStmt()
-			pps := types.CloneRow(sessVars.PreparedParams)
-			sessVars.PrevStmt = executor.FormatSQL(s.OriginText(), pps)
+			s.(*executor.ExecStmt).FinishExecuteStmt(origTxnCtx.StartTS, err == nil, false)
 		}
 	}()
 
@@ -272,16 +282,12 @@ func runStmt(ctx context.Context, sctx sessionctx.Context, s sqlexec.Statement) 
 		}
 
 		// Handle the stmt commit/rollback.
-		if txn, err1 := sctx.Txn(false); err1 == nil {
-			if txn.Valid() {
-				if err != nil {
-					sctx.StmtRollback()
-				} else {
-					err = sctx.StmtCommit(sctx.GetSessionVars().StmtCtx.MemTracker)
-				}
+		if se.txn.Valid() {
+			if err != nil {
+				sctx.StmtRollback()
+			} else {
+				err = sctx.StmtCommit(sctx.GetSessionVars().StmtCtx.MemTracker)
 			}
-		} else {
-			logutil.BgLogger().Error("get txn failed", zap.Error(err1))
 		}
 	}
 	err = finishStmt(ctx, sctx, se, sessVars, err, s)
@@ -368,12 +374,5 @@ func ResultSetToStringSlice(ctx context.Context, s Session, rs sqlexec.RecordSet
 
 // Session errors.
 var (
-	ErrForUpdateCantRetry = terror.ClassSession.New(mysql.ErrForUpdateCantRetry, mysql.MySQLErrName[mysql.ErrForUpdateCantRetry])
+	ErrForUpdateCantRetry = terror.ClassSession.New(errno.ErrForUpdateCantRetry, errno.MySQLErrName[errno.ErrForUpdateCantRetry])
 )
-
-func init() {
-	sessionMySQLErrCodes := map[terror.ErrCode]uint16{
-		mysql.ErrForUpdateCantRetry: mysql.ErrForUpdateCantRetry,
-	}
-	terror.ErrClassToMySQLCodes[terror.ClassSession] = sessionMySQLErrCodes
-}

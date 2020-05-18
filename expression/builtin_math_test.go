@@ -15,7 +15,6 @@ package expression
 
 import (
 	"math"
-	"math/rand"
 	"runtime"
 	"time"
 
@@ -160,7 +159,7 @@ func (s *testEvaluatorSuite) TestExp(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Exp].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Exp].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -269,7 +268,7 @@ func (s *testEvaluatorSuite) TestLog(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Log].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Log].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -305,7 +304,7 @@ func (s *testEvaluatorSuite) TestLog2(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Log2].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Log2].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -341,7 +340,7 @@ func (s *testEvaluatorSuite) TestLog10(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Log10].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Log10].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -357,11 +356,11 @@ func (s *testEvaluatorSuite) TestRand(c *C) {
 	// issue 3211
 	f2, err := fc.getFunction(s.ctx, []Expression{&Constant{Value: types.NewIntDatum(20160101), RetType: types.NewFieldType(mysql.TypeLonglong)}})
 	c.Assert(err, IsNil)
-	randGen := rand.New(rand.NewSource(20160101))
+	randGen := NewWithSeed(20160101)
 	for i := 0; i < 3; i++ {
 		v, err = evalBuiltinFunc(f2, chunk.Row{})
 		c.Assert(err, IsNil)
-		c.Assert(v.GetFloat64(), Equals, randGen.Float64())
+		c.Assert(v.GetFloat64(), Equals, randGen.Gen())
 	}
 }
 
@@ -426,6 +425,8 @@ func (s *testEvaluatorSuite) TestRound(c *C) {
 		{[]interface{}{newDec("1.58"), 1}, newDec("1.6")},
 		{[]interface{}{newDec("23.298"), -1}, newDec("20")},
 		{[]interface{}{nil, 2}, nil},
+		{[]interface{}{1, -2012}, 0},
+		{[]interface{}{1, -201299999999999}, 0},
 	}
 
 	Dtbl := tblToDtbl(tbl)
@@ -582,7 +583,7 @@ func (s *testEvaluatorSuite) TestConv(c *C) {
 		c.Assert(r, Equals, t.ret)
 	}
 
-	_, err := funcs[ast.Conv].getFunction(s.ctx, []Expression{Zero, Zero, Zero})
+	_, err := funcs[ast.Conv].getFunction(s.ctx, []Expression{NewZero(), NewZero(), NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -656,7 +657,7 @@ func (s *testEvaluatorSuite) TestDegrees(c *C) {
 			}
 		}
 	}
-	_, err := funcs[ast.Degrees].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Degrees].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -739,7 +740,7 @@ func (s *testEvaluatorSuite) TestSin(c *C) {
 		{math.Pi / 6, float64(math.Sin(math.Pi / 6)), false, false}, // Pie/6(30 degrees) ==> 0.5
 		{-math.Pi / 6, float64(math.Sin(-math.Pi / 6)), false, false},
 		{math.Pi * 2, float64(math.Sin(math.Pi * 2)), false, false},
-		{string("adfsdfgs"), 0, false, true},
+		{"adfsdfgs", 0, false, true},
 		{"0.000", 0, false, false},
 	}
 
@@ -760,7 +761,7 @@ func (s *testEvaluatorSuite) TestSin(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Sin].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Sin].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -798,7 +799,7 @@ func (s *testEvaluatorSuite) TestCos(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Cos].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Cos].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -834,7 +835,7 @@ func (s *testEvaluatorSuite) TestAcos(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Acos].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Acos].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -870,7 +871,7 @@ func (s *testEvaluatorSuite) TestAsin(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Asin].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Asin].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -906,7 +907,7 @@ func (s *testEvaluatorSuite) TestAtan(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Atan].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Atan].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -943,7 +944,7 @@ func (s *testEvaluatorSuite) TestTan(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Tan].getFunction(s.ctx, []Expression{Zero})
+	_, err := funcs[ast.Tan].getFunction(s.ctx, []Expression{NewZero()})
 	c.Assert(err, IsNil)
 }
 
@@ -985,6 +986,6 @@ func (s *testEvaluatorSuite) TestCot(c *C) {
 		}
 	}
 
-	_, err := funcs[ast.Cot].getFunction(s.ctx, []Expression{One})
+	_, err := funcs[ast.Cot].getFunction(s.ctx, []Expression{NewOne()})
 	c.Assert(err, IsNil)
 }

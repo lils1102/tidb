@@ -79,7 +79,7 @@ func (p *hashPartitionPruner) reduceColumnEQ() bool {
 
 func (p *hashPartitionPruner) reduceConstantEQ() bool {
 	for _, con := range p.conditions {
-		col, cond := validEqualCond(con)
+		col, cond := validEqualCond(p.ctx, con)
 		if col != nil {
 			id := p.getColID(col)
 			if p.constantMap[id] != nil {
@@ -117,6 +117,19 @@ func (p *hashPartitionPruner) tryEvalPartitionExpr(piExpr Expression) (val int64
 			case ast.Div:
 				return rightVal / leftVal, true, false
 			}
+		} else if pi.FuncName.L == ast.Year || pi.FuncName.L == ast.Month || pi.FuncName.L == ast.ToDays {
+			col := pi.GetArgs()[0].(*Column)
+			idx := p.getColID(col)
+			val := p.constantMap[idx]
+			if val != nil {
+				pi.GetArgs()[0] = val
+				ret, _, err := pi.EvalInt(p.ctx, chunk.Row{})
+				if err != nil {
+					return 0, false, false
+				}
+				return ret, true, false
+			}
+			return 0, false, false
 		}
 	case *Constant:
 		val, err := pi.Eval(chunk.Row{})
@@ -163,7 +176,7 @@ func (p *hashPartitionPruner) solve(ctx sessionctx.Context, conds []Expression, 
 	for _, col := range ExtractColumns(piExpr) {
 		p.insertCol(col)
 	}
-	p.constantMap = make([]*Constant, p.numColumn, p.numColumn)
+	p.constantMap = make([]*Constant, p.numColumn)
 	conflict := p.reduceConstantEQ()
 	if conflict {
 		return 0, false, conflict

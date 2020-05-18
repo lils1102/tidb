@@ -18,8 +18,10 @@ import (
 	"math"
 	"strconv"
 
+	"github.com/cznic/mathutil"
 	"github.com/pingcap/tidb/expression"
 	"github.com/pingcap/tidb/planner/property"
+	"github.com/pingcap/tidb/planner/util"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/stringutil"
@@ -68,17 +70,77 @@ func enforceProperty(p *property.PhysicalProperty, tsk task, ctx sessionctx.Cont
 	}
 	tsk = finishCopTask(ctx, tsk)
 	sortReqProp := &property.PhysicalProperty{TaskTp: property.RootTaskType, Items: p.Items, ExpectedCnt: math.MaxFloat64}
-	sort := PhysicalSort{ByItems: make([]*ByItems, 0, len(p.Items))}.Init(ctx, tsk.plan().statsInfo(), tsk.plan().SelectBlockOffset(), sortReqProp)
+	sort := PhysicalSort{ByItems: make([]*util.ByItems, 0, len(p.Items))}.Init(ctx, tsk.plan().statsInfo(), tsk.plan().SelectBlockOffset(), sortReqProp)
 	for _, col := range p.Items {
-		sort.ByItems = append(sort.ByItems, &ByItems{col.Col, col.Desc})
+		sort.ByItems = append(sort.ByItems, &util.ByItems{Expr: col.Col, Desc: col.Desc})
 	}
 	return sort.attach2Task(tsk)
+}
+
+// optimizeByShuffle insert `PhysicalShuffle` to optimize performance by running in a parallel manner.
+func optimizeByShuffle(pp PhysicalPlan, tsk task, ctx sessionctx.Context) task {
+	if tsk.plan() == nil {
+		return tsk
+	}
+
+	// Don't use `tsk.plan()` here, which will probably be different from `pp`.
+	// Eg., when `pp` is `NominalSort`, `tsk.plan()` would be its child.
+	switch p := pp.(type) {
+	case *PhysicalWindow:
+		if shuffle := optimizeByShuffle4Window(p, ctx); shuffle != nil {
+			return shuffle.attach2Task(tsk)
+		}
+	}
+	return tsk
+}
+
+func optimizeByShuffle4Window(pp *PhysicalWindow, ctx sessionctx.Context) *PhysicalShuffle {
+	concurrency := ctx.GetSessionVars().WindowConcurrency
+	if concurrency <= 1 {
+		return nil
+	}
+
+	sort, ok := pp.Children()[0].(*PhysicalSort)
+	if !ok {
+		// Multi-thread executing on SORTED data source is not effective enough by current implementation.
+		// TODO: Implement a better one.
+		return nil
+	}
+	tail, dataSource := sort, sort.Children()[0]
+
+	partitionBy := make([]*expression.Column, 0, len(pp.PartitionBy))
+	for _, item := range pp.PartitionBy {
+		partitionBy = append(partitionBy, item.Col)
+	}
+	NDV := int(getCardinality(partitionBy, dataSource.Schema(), dataSource.statsInfo()))
+	if NDV <= 1 {
+		return nil
+	}
+	concurrency = mathutil.Min(concurrency, NDV)
+
+	byItems := make([]expression.Expression, 0, len(pp.PartitionBy))
+	for _, item := range pp.PartitionBy {
+		byItems = append(byItems, item.Col)
+	}
+	reqProp := &property.PhysicalProperty{ExpectedCnt: math.MaxFloat64}
+	shuffle := PhysicalShuffle{
+		Concurrency:  concurrency,
+		Tail:         tail,
+		DataSource:   dataSource,
+		SplitterType: PartitionHashSplitterType,
+		HashByItems:  byItems,
+	}.Init(ctx, pp.statsInfo(), pp.SelectBlockOffset(), reqProp)
+	return shuffle
 }
 
 // LogicalPlan is a tree of logical operators.
 // We can do a lot of logical optimizations to it, like predicate pushdown and column pruning.
 type LogicalPlan interface {
 	Plan
+
+	// HashCode encodes a LogicalPlan to fast compare whether a LogicalPlan equals to another.
+	// We use a strict encode method here which ensures there is no conflict.
+	HashCode() []byte
 
 	// PredicatePushDown pushes down the predicates in the where/on/having clauses as deeply as possible.
 	// It will accept a predicate that is an expression slice, and return the expressions that can't be pushed.
@@ -116,9 +178,13 @@ type LogicalPlan interface {
 	PreparePossibleProperties(schema *expression.Schema, childrenProperties ...[][]*expression.Column) [][]*expression.Column
 
 	// exhaustPhysicalPlans generates all possible plans that can match the required property.
-	exhaustPhysicalPlans(*property.PhysicalProperty) []PhysicalPlan
+	// It will return:
+	// 1. All possible plans that can match the required property.
+	// 2. Whether the SQL hint can work. Return true if there is no hint.
+	exhaustPhysicalPlans(*property.PhysicalProperty) (physicalPlans []PhysicalPlan, hintCanWork bool)
 
-	extractCorrelatedCols() []*expression.CorrelatedColumn
+	// ExtractCorrelatedCols extracts correlated columns inside the LogicalPlan.
+	ExtractCorrelatedCols() []*expression.CorrelatedColumn
 
 	// MaxOneRow means whether this operator only returns max one row.
 	MaxOneRow() bool
@@ -285,12 +351,8 @@ func newBasePhysicalPlan(ctx sessionctx.Context, tp string, self PhysicalPlan, o
 	}
 }
 
-func (p *baseLogicalPlan) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := make([]*expression.CorrelatedColumn, 0, len(p.children))
-	for _, child := range p.children {
-		corCols = append(corCols, child.extractCorrelatedCols()...)
-	}
-	return corCols
+func (p *baseLogicalPlan) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	return nil
 }
 
 // PruneColumns implements LogicalPlan interface.

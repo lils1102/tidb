@@ -15,12 +15,14 @@ package mocktikv
 
 import (
 	"context"
+	"math"
 	"sync"
 	"time"
 
+	"github.com/pingcap/errors"
 	"github.com/pingcap/kvproto/pkg/metapb"
 	"github.com/pingcap/kvproto/pkg/pdpb"
-	pd "github.com/pingcap/pd/client"
+	"github.com/pingcap/pd/v4/client"
 )
 
 // Use global variables to prevent pdClients from creating duplicate timestamps.
@@ -33,16 +35,24 @@ var tsMu = struct {
 type pdClient struct {
 	cluster *Cluster
 	// SafePoint set by `UpdateGCSafePoint`. Not to be confused with SafePointKV.
-	gcSafePoint   uint64
-	gcSafePointMu sync.Mutex
+	gcSafePoint uint64
+	// Represents the current safePoint of all services including TiDB, representing how much data they want to retain
+	// in GC.
+	serviceSafePoints map[string]uint64
+	gcSafePointMu     sync.Mutex
 }
 
 // NewPDClient creates a mock pd.Client that uses local timestamp and meta data
 // from a Cluster.
 func NewPDClient(cluster *Cluster) pd.Client {
 	return &pdClient{
-		cluster: cluster,
+		cluster:           cluster,
+		serviceSafePoints: make(map[string]uint64),
 	}
+}
+
+func (c *pdClient) ConfigClient() pd.ConfigClient {
+	return nil
 }
 
 func (c *pdClient) GetClusterID(ctx context.Context) uint64 {
@@ -64,15 +74,20 @@ func (c *pdClient) GetTS(context.Context) (int64, int64, error) {
 }
 
 func (c *pdClient) GetTSAsync(ctx context.Context) pd.TSFuture {
-	return &mockTSFuture{c, ctx}
+	return &mockTSFuture{c, ctx, false}
 }
 
 type mockTSFuture struct {
-	pdc *pdClient
-	ctx context.Context
+	pdc  *pdClient
+	ctx  context.Context
+	used bool
 }
 
 func (m *mockTSFuture) Wait() (int64, int64, error) {
+	if m.used {
+		return 0, 0, errors.New("cannot wait tso twice")
+	}
+	m.used = true
 	return m.pdc.GetTS(m.ctx)
 }
 
@@ -118,6 +133,35 @@ func (c *pdClient) UpdateGCSafePoint(ctx context.Context, safePoint uint64) (uin
 		c.gcSafePoint = safePoint
 	}
 	return c.gcSafePoint, nil
+}
+
+func (c *pdClient) UpdateServiceGCSafePoint(ctx context.Context, serviceID string, ttl int64, safePoint uint64) (uint64, error) {
+	c.gcSafePointMu.Lock()
+	defer c.gcSafePointMu.Unlock()
+
+	if ttl == 0 {
+		delete(c.serviceSafePoints, serviceID)
+	} else {
+		var minSafePoint uint64 = math.MaxUint64
+		for _, ssp := range c.serviceSafePoints {
+			if ssp < minSafePoint {
+				minSafePoint = ssp
+			}
+		}
+
+		if len(c.serviceSafePoints) == 0 || minSafePoint <= safePoint {
+			c.serviceSafePoints[serviceID] = safePoint
+		}
+	}
+
+	// The minSafePoint may have changed. Reload it.
+	var minSafePoint uint64 = math.MaxUint64
+	for _, ssp := range c.serviceSafePoints {
+		if ssp < minSafePoint {
+			minSafePoint = ssp
+		}
+	}
+	return minSafePoint, nil
 }
 
 func (c *pdClient) Close() {

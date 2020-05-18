@@ -20,6 +20,7 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -31,6 +32,7 @@ import (
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/planner/core"
 	"github.com/pingcap/tidb/privilege"
+	"github.com/pingcap/tidb/privilege/privileges"
 	"github.com/pingcap/tidb/session"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/store/mockstore"
@@ -225,7 +227,6 @@ func (s *testPrivilegeSuite) TestCheckPrivilegeWithRoles(c *C) {
 	mustExec(c, rootSe, `GRANT UPDATE ON test.* TO r_2;`)
 	c.Assert(pc.RequestVerification(activeRoles, "test", "", "", mysql.UpdatePriv), IsTrue)
 
-	mustExec(c, se, `flush privileges`)
 	mustExec(c, se, `SET ROLE NONE;`)
 	c.Assert(len(se.GetSessionVars().ActiveRoles), Equals, 0)
 	mustExec(c, se, `SET ROLE DEFAULT;`)
@@ -339,8 +340,7 @@ func (s *testPrivilegeSuite) TestShowGrants(c *C) {
 	_, err = pc.ShowGrants(se, &auth.UserIdentity{Username: "show", Hostname: "localhost"}, nil)
 	c.Assert(err, NotNil)
 	// cant show grants for non-existent
-	errNonexistingGrant := terror.ClassPrivilege.New(mysql.ErrNonexistingGrant, mysql.MySQLErrName[mysql.ErrNonexistingGrant])
-	c.Assert(terror.ErrorEqual(err, errNonexistingGrant), IsTrue)
+	c.Assert(terror.ErrorEqual(err, privileges.ErrNonexistingGrant), IsTrue)
 
 	// Test SHOW GRANTS with USING roles.
 	mustExec(c, se, `CREATE ROLE 'r1', 'r2'`)
@@ -362,7 +362,8 @@ func (s *testPrivilegeSuite) TestShowGrants(c *C) {
 	c.Assert(err, IsNil)
 	c.Assert(gs, HasLen, 3)
 	mustExec(c, se, `GRANT INSERT, DELETE ON test.test TO 'r2'`)
-	mustExec(c, se, `GRANT UPDATE ON a.b TO 'testrole'@'localhost'`)
+	mustExec(c, se, `create table test.b (id int)`)
+	mustExec(c, se, `GRANT UPDATE ON test.b TO 'testrole'@'localhost'`)
 	gs, err = pc.ShowGrants(se, &auth.UserIdentity{Username: "testrole", Hostname: "localhost"}, roles)
 	c.Assert(err, IsNil)
 	c.Assert(gs, HasLen, 5)
@@ -826,6 +827,24 @@ func (s *testPrivilegeSuite) TestCreateDropUser(c *C) {
 	mustExec(c, se, `DROP USER tcd3`)
 }
 
+func (s *testPrivilegeSuite) TestConfigPrivilege(c *C) {
+	se := newSession(c, s.store, s.dbName)
+	mustExec(c, se, `DROP USER IF EXISTS tcd1`)
+	mustExec(c, se, `CREATE USER tcd1`)
+	mustExec(c, se, `GRANT ALL ON *.* to tcd1`)
+	mustExec(c, se, `DROP USER IF EXISTS tcd2`)
+	mustExec(c, se, `CREATE USER tcd2`)
+	mustExec(c, se, `GRANT ALL ON *.* to tcd2`)
+	mustExec(c, se, `REVOKE CONFIG ON *.* FROM tcd2`)
+
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "tcd1", Hostname: "localhost", AuthHostname: "tcd1", AuthUsername: "%"}, nil, nil), IsTrue)
+	mustExec(c, se, `SET CONFIG TIKV testkey="testval"`)
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "tcd2", Hostname: "localhost", AuthHostname: "tcd2", AuthUsername: "%"}, nil, nil), IsTrue)
+	_, err := se.Execute(context.Background(), `SET CONFIG TIKV testkey="testval"`)
+	c.Assert(err, ErrorMatches, ".*you need \\(at least one of\\) the CONFIG privilege\\(s\\) for this operation")
+	mustExec(c, se, `DROP USER tcd1, tcd2`)
+}
+
 func (s *testPrivilegeSuite) TestShowCreateTable(c *C) {
 	se := newSession(c, s.store, s.dbName)
 	mustExec(c, se, `CREATE USER tsct1, tsct2`)
@@ -879,8 +898,7 @@ func (s *testPrivilegeSuite) TestAnalyzeTable(c *C) {
 
 }
 
-func (s *testPrivilegeSuite) TestInformationSchema(c *C) {
-
+func (s *testPrivilegeSuite) TestSystemSchema(c *C) {
 	// This test tests no privilege check for INFORMATION_SCHEMA database.
 	se := newSession(c, s.store, s.dbName)
 	mustExec(c, se, `CREATE USER 'u1'@'localhost';`)
@@ -892,6 +910,24 @@ func (s *testPrivilegeSuite) TestInformationSchema(c *C) {
 	_, err = se.Execute(context.Background(), "drop table information_schema.tables")
 	c.Assert(strings.Contains(err.Error(), "denied to user"), IsTrue)
 	_, err = se.Execute(context.Background(), "update information_schema.tables set table_name = 'tst' where table_name = 'mysql'")
+	c.Assert(strings.Contains(err.Error(), "privilege check fail"), IsTrue)
+
+	// Test performance_schema.
+	mustExec(c, se, `select * from performance_schema.events_statements_summary_by_digest`)
+	_, err = se.Execute(context.Background(), "drop table performance_schema.events_statements_summary_by_digest")
+	c.Assert(strings.Contains(err.Error(), "denied to user"), IsTrue)
+	_, err = se.Execute(context.Background(), "update performance_schema.events_statements_summary_by_digest set schema_name = 'tst'")
+	c.Assert(strings.Contains(err.Error(), "privilege check fail"), IsTrue)
+	_, err = se.Execute(context.Background(), "delete from performance_schema.events_statements_summary_by_digest")
+	c.Assert(strings.Contains(err.Error(), "privilege check fail"), IsTrue)
+
+	// Test metric_schema.
+	mustExec(c, se, `select * from metrics_schema.tidb_query_duration`)
+	_, err = se.Execute(context.Background(), "drop table metrics_schema.tidb_query_duration")
+	c.Assert(strings.Contains(err.Error(), "denied to user"), IsTrue)
+	_, err = se.Execute(context.Background(), "update metrics_schema.tidb_query_duration set instance = 'tst'")
+	c.Assert(strings.Contains(err.Error(), "privilege check fail"), IsTrue)
+	_, err = se.Execute(context.Background(), "delete from metrics_schema.tidb_query_duration")
 	c.Assert(strings.Contains(err.Error(), "privilege check fail"), IsTrue)
 }
 
@@ -909,6 +945,35 @@ func (s *testPrivilegeSuite) TestAdminCommand(c *C) {
 
 	c.Assert(se.Auth(&auth.UserIdentity{Username: "root", Hostname: "localhost"}, nil, nil), IsTrue)
 	_, err = se.Execute(context.Background(), "ADMIN SHOW DDL JOBS")
+	c.Assert(err, IsNil)
+}
+
+func (s *testPrivilegeSuite) TestLoadDataPrivilege(c *C) {
+	// Create file.
+	path := "/tmp/load_data_priv.csv"
+	fp, err := os.Create(path)
+	c.Assert(err, IsNil)
+	c.Assert(fp, NotNil)
+	defer func() {
+		err = fp.Close()
+		c.Assert(err, IsNil)
+		err = os.Remove(path)
+		c.Assert(err, IsNil)
+	}()
+	fp.WriteString("1\n")
+
+	se := newSession(c, s.store, s.dbName)
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "root", Hostname: "localhost"}, nil, nil), IsTrue)
+	mustExec(c, se, `CREATE USER 'test_load'@'localhost';`)
+	mustExec(c, se, `CREATE TABLE t_load(a int)`)
+	mustExec(c, se, `GRANT SELECT on *.* to 'test_load'@'localhost'`)
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "test_load", Hostname: "localhost"}, nil, nil), IsTrue)
+	_, err = se.Execute(context.Background(), "LOAD DATA LOCAL INFILE '/tmp/load_data_priv.csv' INTO TABLE t_load")
+	c.Assert(strings.Contains(err.Error(), "INSERT command denied to user 'test_load'@'localhost' for table 't_load'"), IsTrue)
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "root", Hostname: "localhost"}, nil, nil), IsTrue)
+	mustExec(c, se, `GRANT INSERT on *.* to 'test_load'@'localhost'`)
+	c.Assert(se.Auth(&auth.UserIdentity{Username: "test_load", Hostname: "localhost"}, nil, nil), IsTrue)
+	_, err = se.Execute(context.Background(), "LOAD DATA LOCAL INFILE '/tmp/load_data_priv.csv' INTO TABLE t_load")
 	c.Assert(err, IsNil)
 }
 
@@ -991,7 +1056,7 @@ func mustExec(c *C, se session.Session, sql string) {
 }
 
 func newStore(c *C, dbPath string) (*domain.Domain, kv.Storage) {
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	session.SetSchemaLease(0)
 	session.DisableStats4Test()
 	c.Assert(err, IsNil)

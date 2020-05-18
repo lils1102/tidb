@@ -133,8 +133,6 @@ type LogicalJoin struct {
 	RightConditions expression.CNFExprs
 	OtherConditions expression.CNFExprs
 
-	LeftJoinKeys    []*expression.Column
-	RightJoinKeys   []*expression.Column
 	leftProperties  [][]*expression.Column
 	rightProperties [][]*expression.Column
 
@@ -151,6 +149,21 @@ type LogicalJoin struct {
 
 	// equalCondOutCnt indicates the estimated count of joined rows after evaluating `EqualConditions`.
 	equalCondOutCnt float64
+}
+
+// Shallow shallow copies a LogicalJoin struct.
+func (p *LogicalJoin) Shallow() *LogicalJoin {
+	join := *p
+	return join.Init(p.ctx, p.blockOffset)
+}
+
+// GetJoinKeys extracts join keys(columns) from EqualConditions.
+func (p *LogicalJoin) GetJoinKeys() (leftKeys, rightKeys []*expression.Column) {
+	for _, expr := range p.EqualConditions {
+		leftKeys = append(leftKeys, expr.GetArgs()[0].(*expression.Column))
+		rightKeys = append(rightKeys, expr.GetArgs()[1].(*expression.Column))
+	}
+	return
 }
 
 func (p *LogicalJoin) columnSubstitute(schema *expression.Schema, exprs []expression.Expression) {
@@ -204,14 +217,20 @@ func (p *LogicalJoin) columnSubstitute(schema *expression.Schema, exprs []expres
 // `OtherConditions` by the result of extract.
 func (p *LogicalJoin) AttachOnConds(onConds []expression.Expression) {
 	eq, left, right, other := p.extractOnCondition(onConds, false, false)
+	p.AppendJoinConds(eq, left, right, other)
+}
+
+// AppendJoinConds appends new join conditions.
+func (p *LogicalJoin) AppendJoinConds(eq []*expression.ScalarFunction, left, right, other []expression.Expression) {
 	p.EqualConditions = append(eq, p.EqualConditions...)
 	p.LeftConditions = append(left, p.LeftConditions...)
 	p.RightConditions = append(right, p.RightConditions...)
 	p.OtherConditions = append(other, p.OtherConditions...)
 }
 
-func (p *LogicalJoin) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (p *LogicalJoin) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(p.EqualConditions)+len(p.LeftConditions)+len(p.RightConditions)+len(p.OtherConditions))
 	for _, fun := range p.EqualConditions {
 		corCols = append(corCols, expression.ExtractCorColumns(fun)...)
 	}
@@ -225,6 +244,15 @@ func (p *LogicalJoin) extractCorrelatedCols() []*expression.CorrelatedColumn {
 		corCols = append(corCols, expression.ExtractCorColumns(fun)...)
 	}
 	return corCols
+}
+
+// ExtractJoinKeys extract join keys as a schema for child with childIdx.
+func (p *LogicalJoin) ExtractJoinKeys(childIdx int) *expression.Schema {
+	joinKeys := make([]*expression.Column, 0, len(p.EqualConditions))
+	for _, eqCond := range p.EqualConditions {
+		joinKeys = append(joinKeys, eqCond.GetArgs()[childIdx].(*expression.Column))
+	}
+	return expression.NewSchema(joinKeys...)
 }
 
 // LogicalProjection represents a select fields plan.
@@ -251,12 +279,21 @@ type LogicalProjection struct {
 	AvoidColumnEvaluator bool
 }
 
-func (p *LogicalProjection) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (p *LogicalProjection) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(p.Exprs))
 	for _, expr := range p.Exprs {
 		corCols = append(corCols, expression.ExtractCorColumns(expr)...)
 	}
 	return corCols
+}
+
+// GetUsedCols extracts all of the Columns used by proj.
+func (p *LogicalProjection) GetUsedCols() (usedCols []*expression.Column) {
+	for _, expr := range p.Exprs {
+		usedCols = append(usedCols, expression.ExtractColumns(expr)...)
+	}
+	return usedCols
 }
 
 // LogicalAggregation represents an aggregate plan.
@@ -275,6 +312,16 @@ type LogicalAggregation struct {
 	inputCount         float64 // inputCount is the input count of this plan.
 }
 
+// HasDistinct shows whether LogicalAggregation has functions with distinct.
+func (la *LogicalAggregation) HasDistinct() bool {
+	for _, aggFunc := range la.AggFuncs {
+		if aggFunc.HasDistinct {
+			return true
+		}
+	}
+	return false
+}
+
 // CopyAggHints copies the aggHints from another LogicalAggregation.
 func (la *LogicalAggregation) CopyAggHints(agg *LogicalAggregation) {
 	// TODO: Copy the hint may make the un-applicable hint throw the
@@ -291,6 +338,12 @@ func (la *LogicalAggregation) IsPartialModeAgg() bool {
 	return la.AggFuncs[0].Mode == aggregation.Partial1Mode
 }
 
+// IsCompleteModeAgg returns if all of the AggFuncs are CompleteMode.
+func (la *LogicalAggregation) IsCompleteModeAgg() bool {
+	// Since all of the AggFunc share the same AggMode, we only need to check the first one.
+	return la.AggFuncs[0].Mode == aggregation.CompleteMode
+}
+
 // GetGroupByCols returns the groupByCols. If the groupByCols haven't be collected,
 // this method would collect them at first. If the GroupByItems have been changed,
 // we should explicitly collect GroupByColumns before this method.
@@ -301,8 +354,9 @@ func (la *LogicalAggregation) GetGroupByCols() []*expression.Column {
 	return la.groupByCols
 }
 
-func (la *LogicalAggregation) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := la.baseLogicalPlan.extractCorrelatedCols()
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (la *LogicalAggregation) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(la.GroupByItems)+len(la.AggFuncs))
 	for _, expr := range la.GroupByItems {
 		corCols = append(corCols, expression.ExtractCorColumns(expr)...)
 	}
@@ -312,6 +366,19 @@ func (la *LogicalAggregation) extractCorrelatedCols() []*expression.CorrelatedCo
 		}
 	}
 	return corCols
+}
+
+// GetUsedCols extracts all of the Columns used by agg including GroupByItems and AggFuncs.
+func (la *LogicalAggregation) GetUsedCols() (usedCols []*expression.Column) {
+	for _, groupByItem := range la.GroupByItems {
+		usedCols = append(usedCols, expression.ExtractColumns(groupByItem)...)
+	}
+	for _, aggDesc := range la.AggFuncs {
+		for _, expr := range aggDesc.Args {
+			usedCols = append(usedCols, expression.ExtractColumns(expr)...)
+		}
+	}
+	return usedCols
 }
 
 // LogicalSelection represents a where or having predicate.
@@ -324,8 +391,9 @@ type LogicalSelection struct {
 	Conditions []expression.Expression
 }
 
-func (p *LogicalSelection) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := p.baseLogicalPlan.extractCorrelatedCols()
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (p *LogicalSelection) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(p.Conditions))
 	for _, cond := range p.Conditions {
 		corCols = append(corCols, expression.ExtractCorColumns(cond)...)
 	}
@@ -339,8 +407,9 @@ type LogicalApply struct {
 	CorCols []*expression.CorrelatedColumn
 }
 
-func (la *LogicalApply) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := la.LogicalJoin.extractCorrelatedCols()
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (la *LogicalApply) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := la.LogicalJoin.ExtractCorrelatedCols()
 	for i := len(corCols) - 1; i >= 0; i-- {
 		if la.children[0].Schema().Contains(&corCols[i].Column) {
 			corCols = append(corCols[:i], corCols[i+1:]...)
@@ -374,8 +443,14 @@ type LogicalMemTable struct {
 	logicalSchemaProducer
 
 	Extractor MemTablePredicateExtractor
-	dbName    model.CIStr
-	tableInfo *model.TableInfo
+	DBName    model.CIStr
+	TableInfo *model.TableInfo
+	// QueryTimeRange is used to specify the time range for metrics summary tables and inspection tables
+	// e.g: select /*+ time_range('2020-02-02 12:10:00', '2020-02-02 13:00:00') */ from metrics_summary;
+	//      select /*+ time_range('2020-02-02 12:10:00', '2020-02-02 13:00:00') */ from metrics_summary_by_label;
+	//      select /*+ time_range('2020-02-02 12:10:00', '2020-02-02 13:00:00') */ from inspection_summary;
+	//      select /*+ time_range('2020-02-02 12:10:00', '2020-02-02 13:00:00') */ from inspection_result;
+	QueryTimeRange QueryTimeRange
 }
 
 // LogicalUnionScan is only used in non read-only txn.
@@ -428,6 +503,15 @@ type DataSource struct {
 	TblColHists *statistics.HistColl
 	//preferStoreType means the DataSource is enforced to which storage.
 	preferStoreType int
+}
+
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (ds *DataSource) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(ds.pushedDownConds))
+	for _, expr := range ds.pushedDownConds {
+		corCols = append(corCols, expression.ExtractCorColumns(expr)...)
+	}
+	return corCols
 }
 
 // TiKVSingleGather is a leaf logical operator of TiDB layer to gather
@@ -623,7 +707,7 @@ func (ds *DataSource) deriveTablePathStats(path *util.AccessPath, conds []expres
 	// If the `CountAfterAccess` is less than `stats.RowCount`, there must be some inconsistent stats info.
 	// We prefer the `stats.RowCount` because it could use more stats info to calculate the selectivity.
 	if path.CountAfterAccess < ds.stats.RowCount && !isIm {
-		path.CountAfterAccess = math.Min(ds.stats.RowCount/selectionFactor, float64(ds.statisticTable.Count))
+		path.CountAfterAccess = math.Min(ds.stats.RowCount/SelectionFactor, float64(ds.statisticTable.Count))
 	}
 	// Check whether the primary key is covered by point query.
 	noIntervalRange := true
@@ -678,7 +762,7 @@ func (ds *DataSource) fillIndexPath(path *util.AccessPath, conds []expression.Ex
 func (ds *DataSource) deriveIndexPathStats(path *util.AccessPath, conds []expression.Expression, isIm bool) bool {
 	sc := ds.ctx.GetSessionVars().StmtCtx
 	if path.EqOrInCondCount == len(path.AccessConds) {
-		accesses, remained := path.SplitCorColAccessCondFromFilters(path.EqOrInCondCount)
+		accesses, remained := path.SplitCorColAccessCondFromFilters(ds.ctx, path.EqOrInCondCount)
 		path.AccessConds = append(path.AccessConds, accesses...)
 		path.TableFilters = remained
 		if len(accesses) > 0 && ds.statisticTable.Pseudo {
@@ -700,13 +784,13 @@ func (ds *DataSource) deriveIndexPathStats(path *util.AccessPath, conds []expres
 	// If the `CountAfterAccess` is less than `stats.RowCount`, there must be some inconsistent stats info.
 	// We prefer the `stats.RowCount` because it could use more stats info to calculate the selectivity.
 	if path.CountAfterAccess < ds.stats.RowCount && !isIm {
-		path.CountAfterAccess = math.Min(ds.stats.RowCount/selectionFactor, float64(ds.statisticTable.Count))
+		path.CountAfterAccess = math.Min(ds.stats.RowCount/SelectionFactor, float64(ds.statisticTable.Count))
 	}
 	if path.IndexFilters != nil {
 		selectivity, _, err := ds.tableStats.HistColl.Selectivity(ds.ctx, path.IndexFilters, nil)
 		if err != nil {
 			logutil.BgLogger().Debug("calculate selectivity failed, use selection factor", zap.Error(err))
-			selectivity = selectionFactor
+			selectivity = SelectionFactor
 		}
 		if isIm {
 			path.CountAfterIndex = path.CountAfterAccess * selectivity
@@ -800,11 +884,12 @@ type LogicalUnionAll struct {
 type LogicalSort struct {
 	baseLogicalPlan
 
-	ByItems []*ByItems
+	ByItems []*util.ByItems
 }
 
-func (ls *LogicalSort) extractCorrelatedCols() []*expression.CorrelatedColumn {
-	corCols := ls.baseLogicalPlan.extractCorrelatedCols()
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (ls *LogicalSort) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(ls.ByItems))
 	for _, item := range ls.ByItems {
 		corCols = append(corCols, expression.ExtractCorColumns(item.Expr)...)
 	}
@@ -815,9 +900,18 @@ func (ls *LogicalSort) extractCorrelatedCols() []*expression.CorrelatedColumn {
 type LogicalTopN struct {
 	baseLogicalPlan
 
-	ByItems []*ByItems
+	ByItems []*util.ByItems
 	Offset  uint64
 	Count   uint64
+}
+
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (lt *LogicalTopN) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(lt.ByItems))
+	for _, item := range lt.ByItems {
+		corCols = append(corCols, expression.ExtractCorColumns(item.Expr)...)
+	}
+	return corCols
 }
 
 // isLimit checks if TopN is a limit plan.
@@ -837,8 +931,9 @@ type LogicalLimit struct {
 type LogicalLock struct {
 	baseLogicalPlan
 
-	Lock         ast.SelectLockType
-	tblID2Handle map[int64][]*expression.Column
+	Lock             ast.SelectLockType
+	tblID2Handle     map[int64][]*expression.Column
+	partitionedTable []table.PartitionedTable
 }
 
 // WindowFrame represents a window function frame.
@@ -871,16 +966,38 @@ type LogicalWindow struct {
 	Frame           *WindowFrame
 }
 
+// ExtractCorrelatedCols implements LogicalPlan interface.
+func (p *LogicalWindow) ExtractCorrelatedCols() []*expression.CorrelatedColumn {
+	corCols := make([]*expression.CorrelatedColumn, 0, len(p.WindowFuncDescs))
+	for _, windowFunc := range p.WindowFuncDescs {
+		for _, arg := range windowFunc.Args {
+			corCols = append(corCols, expression.ExtractCorColumns(arg)...)
+		}
+	}
+	if p.Frame != nil {
+		if p.Frame.Start != nil {
+			for _, expr := range p.Frame.Start.CalcFuncs {
+				corCols = append(corCols, expression.ExtractCorColumns(expr)...)
+			}
+		}
+		if p.Frame.End != nil {
+			for _, expr := range p.Frame.End.CalcFuncs {
+				corCols = append(corCols, expression.ExtractCorColumns(expr)...)
+			}
+		}
+	}
+	return corCols
+}
+
 // GetWindowResultColumns returns the columns storing the result of the window function.
 func (p *LogicalWindow) GetWindowResultColumns() []*expression.Column {
 	return p.schema.Columns[p.schema.Len()-len(p.WindowFuncDescs):]
 }
 
-// extractCorColumnsBySchema only extracts the correlated columns that match the specified schema.
+// ExtractCorColumnsBySchema only extracts the correlated columns that match the specified schema.
 // e.g. If the correlated columns from plan are [t1.a, t2.a, t3.a] and specified schema is [t2.a, t2.b, t2.c],
 // only [t2.a] is returned.
-func extractCorColumnsBySchema(p LogicalPlan, schema *expression.Schema) []*expression.CorrelatedColumn {
-	corCols := p.extractCorrelatedCols()
+func ExtractCorColumnsBySchema(corCols []*expression.CorrelatedColumn, schema *expression.Schema) []*expression.CorrelatedColumn {
 	resultCorCols := make([]*expression.CorrelatedColumn, schema.Len())
 	for _, corCol := range corCols {
 		idx := schema.ColumnIndex(&corCol.Column)
@@ -903,6 +1020,14 @@ func extractCorColumnsBySchema(p LogicalPlan, schema *expression.Schema) []*expr
 		}
 	}
 	return resultCorCols[:length]
+}
+
+// extractCorColumnsBySchema only extracts the correlated columns that match the specified schema.
+// e.g. If the correlated columns from plan are [t1.a, t2.a, t3.a] and specified schema is [t2.a, t2.b, t2.c],
+// only [t2.a] is returned.
+func extractCorColumnsBySchema(p LogicalPlan, schema *expression.Schema) []*expression.CorrelatedColumn {
+	corCols := ExtractCorrelatedCols(p)
+	return ExtractCorColumnsBySchema(corCols, schema)
 }
 
 // ShowContents stores the contents for the `SHOW` statement.

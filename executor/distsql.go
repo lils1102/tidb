@@ -58,7 +58,7 @@ var LookupTableTaskChannelSize int32 = 50
 // lookupTableTask is created from a partial result of an index request which
 // contains the handles in those index keys.
 type lookupTableTask struct {
-	handles []int64
+	handles []kv.Handle
 	rowIdx  []int // rowIdx represents the handle index for every row. Only used when keep order.
 	rows    []chunk.Row
 	idxRows *chunk.Chunk
@@ -70,10 +70,10 @@ type lookupTableTask struct {
 	// Without this map, the original index order might be lost.
 	// The handles fetched from index is originally ordered by index, but we need handles to be ordered by itself
 	// to do table request.
-	indexOrder map[int64]int
+	indexOrder *kv.HandleMap
 	// duplicatedIndexOrder map likes indexOrder. But it's used when checkIndexValue isn't nil and
 	// the same handle of index has multiple values.
-	duplicatedIndexOrder map[int64]int
+	duplicatedIndexOrder *kv.HandleMap
 
 	// memUsage records the memory usage of this task calculated by table worker.
 	// memTracker is used to release memUsage after task is done and unused.
@@ -290,7 +290,7 @@ func (e *IndexReaderExecutor) open(ctx context.Context, kvRanges []kv.KeyRange) 
 	}
 	e.kvRanges = kvRanges
 
-	e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaDistSQL)
+	e.memTracker = memory.NewTracker(e.id, -1)
 	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
 	var builder distsql.RequestBuilder
 	kvReq, err := builder.SetKeyRanges(kvRanges).
@@ -397,7 +397,7 @@ func (e *IndexLookUpExecutor) open(ctx context.Context) error {
 	// instead of in function "Open", because this "IndexLookUpExecutor" may be
 	// constructed by a "IndexLookUpJoin" and "Open" will not be called in that
 	// situation.
-	e.memTracker = memory.NewTracker(e.id, e.ctx.GetSessionVars().MemQuotaIndexLookupReader)
+	e.memTracker = memory.NewTracker(e.id, -1)
 	e.memTracker.AttachTo(e.ctx.GetSessionVars().StmtCtx.MemTracker)
 
 	e.finished = make(chan struct{})
@@ -439,7 +439,7 @@ func (e *IndexLookUpExecutor) startIndexWorker(ctx context.Context, kvRanges []k
 		e.dagPB.CollectExecutionSummaries = &collExec
 	}
 
-	tracker := memory.NewTracker(stringutil.StringerStr("IndexWorker"), e.ctx.GetSessionVars().MemQuotaIndexLookupReader)
+	tracker := memory.NewTracker(stringutil.StringerStr("IndexWorker"), -1)
 	tracker.AttachTo(e.memTracker)
 	var builder distsql.RequestBuilder
 	kvReq, err := builder.SetKeyRanges(kvRanges).
@@ -518,8 +518,7 @@ func (e *IndexLookUpExecutor) startTableWorker(ctx context.Context, workCh <-cha
 			keepOrder:       e.keepOrder,
 			handleIdx:       e.handleIdx,
 			checkIndexValue: e.checkIndexValue,
-			memTracker: memory.NewTracker(stringutil.MemoizeStr(func() string { return "TableWorker_" + strconv.Itoa(workerID) }),
-				e.ctx.GetSessionVars().MemQuotaIndexLookupReader),
+			memTracker:      memory.NewTracker(stringutil.MemoizeStr(func() string { return "TableWorker_" + strconv.Itoa(workerID) }), -1),
 		}
 		worker.memTracker.AttachTo(e.memTracker)
 		ctx1, cancel := context.WithCancel(ctx)
@@ -531,7 +530,7 @@ func (e *IndexLookUpExecutor) startTableWorker(ctx context.Context, workCh <-cha
 	}
 }
 
-func (e *IndexLookUpExecutor) buildTableReader(ctx context.Context, handles []int64) (Executor, error) {
+func (e *IndexLookUpExecutor) buildTableReader(ctx context.Context, handles []kv.Handle) (Executor, error) {
 	tableReaderExec := &TableReaderExecutor{
 		baseExecutor:   newBaseExecutor(e.ctx, e.schema, stringutil.MemoizeStr(func() string { return e.id.String() + "_tableReader" })),
 		table:          e.table,
@@ -694,9 +693,9 @@ func (w *indexWorker) fetchHandles(ctx context.Context, result distsql.SelectRes
 }
 
 func (w *indexWorker) extractTaskHandles(ctx context.Context, chk *chunk.Chunk, idxResult distsql.SelectResult, count uint64) (
-	handles []int64, retChk *chunk.Chunk, scannedKeys uint64, err error) {
+	handles []kv.Handle, retChk *chunk.Chunk, scannedKeys uint64, err error) {
 	handleOffset := chk.NumCols() - 1
-	handles = make([]int64, 0, w.batchSize)
+	handles = make([]kv.Handle, 0, w.batchSize)
 	// PushedLimit would always be nil for CheckIndex or CheckTable, we add this check just for insurance.
 	checkLimit := (w.PushedLimit != nil) && (w.checkIndexValue == nil)
 	for len(handles) < w.batchSize {
@@ -730,7 +729,7 @@ func (w *indexWorker) extractTaskHandles(ctx context.Context, chk *chunk.Chunk, 
 					return handles, nil, scannedKeys, nil
 				}
 			}
-			h := chk.GetRow(i).GetInt64(handleOffset)
+			h := kv.IntHandle(chk.GetRow(i).GetInt64(handleOffset))
 			handles = append(handles, h)
 		}
 		if w.checkIndexValue != nil {
@@ -747,26 +746,26 @@ func (w *indexWorker) extractTaskHandles(ctx context.Context, chk *chunk.Chunk, 
 	return handles, retChk, scannedKeys, nil
 }
 
-func (w *indexWorker) buildTableTask(handles []int64, retChk *chunk.Chunk) *lookupTableTask {
-	var indexOrder map[int64]int
-	var duplicatedIndexOrder map[int64]int
+func (w *indexWorker) buildTableTask(handles []kv.Handle, retChk *chunk.Chunk) *lookupTableTask {
+	var indexOrder *kv.HandleMap
+	var duplicatedIndexOrder *kv.HandleMap
 	if w.keepOrder {
 		// Save the index order.
-		indexOrder = make(map[int64]int, len(handles))
+		indexOrder = kv.NewHandleMap()
 		for i, h := range handles {
-			indexOrder[h] = i
+			indexOrder.Set(h, i)
 		}
 	}
 
 	if w.checkIndexValue != nil {
 		// Save the index order.
-		indexOrder = make(map[int64]int, len(handles))
-		duplicatedIndexOrder = make(map[int64]int)
+		indexOrder = kv.NewHandleMap()
+		duplicatedIndexOrder = kv.NewHandleMap()
 		for i, h := range handles {
-			if _, ok := indexOrder[h]; ok {
-				duplicatedIndexOrder[h] = i
+			if _, ok := indexOrder.Get(h); ok {
+				duplicatedIndexOrder.Set(h, i)
 			} else {
-				indexOrder[h] = i
+				indexOrder.Set(h, i)
 			}
 		}
 	}
@@ -787,7 +786,7 @@ type tableWorker struct {
 	idxLookup      *IndexLookUpExecutor
 	workCh         <-chan *lookupTableTask
 	finished       <-chan struct{}
-	buildTblReader func(ctx context.Context, handles []int64) (Executor, error)
+	buildTblReader func(ctx context.Context, handles []kv.Handle) (Executor, error)
 	keepOrder      bool
 	handleIdx      int
 
@@ -838,9 +837,13 @@ func (w *tableWorker) compareData(ctx context.Context, task *lookupTableTask, ta
 			return errors.Trace(err)
 		}
 		if chk.NumRows() == 0 {
-			for h := range task.indexOrder {
-				idxRow := task.idxRows.GetRow(task.indexOrder[h])
-				return errors.Errorf("handle %#v, index:%#v != record:%#v", h, idxRow.GetDatum(0, w.idxColTps[0]), nil)
+			task.indexOrder.Range(func(h kv.Handle, val interface{}) bool {
+				idxRow := task.idxRows.GetRow(val.(int))
+				err = errors.Errorf("handle %#v, index:%#v != record:%#v", h, idxRow.GetDatum(0, w.idxColTps[0]), nil)
+				return false
+			})
+			if err != nil {
+				return err
 			}
 			break
 		}
@@ -848,12 +851,13 @@ func (w *tableWorker) compareData(ctx context.Context, task *lookupTableTask, ta
 		tblReaderExec := tableReader.(*TableReaderExecutor)
 		iter := chunk.NewIterator4Chunk(chk)
 		for row := iter.Begin(); row != iter.End(); row = iter.Next() {
-			handle := row.GetInt64(w.handleIdx)
-			offset, ok := task.indexOrder[handle]
+			handle := kv.IntHandle(row.GetInt64(w.handleIdx))
+			v, ok := task.indexOrder.Get(handle)
 			if !ok {
-				offset = task.duplicatedIndexOrder[handle]
+				v, _ = task.duplicatedIndexOrder.Get(handle)
 			}
-			delete(task.indexOrder, handle)
+			offset, _ := v.(int)
+			task.indexOrder.Delete(handle)
 			idxRow := task.idxRows.GetRow(offset)
 			vals = vals[:0]
 			for i, col := range w.idxTblCols {
@@ -864,7 +868,7 @@ func (w *tableWorker) compareData(ctx context.Context, task *lookupTableTask, ta
 					if err != nil {
 						return errors.Trace(err)
 					}
-					val, err = table.CastValue(tblReaderExec.ctx, val, col.ColumnInfo)
+					val, err = table.CastValue(tblReaderExec.ctx, val, col.ColumnInfo, false)
 					if err != nil {
 						return errors.Trace(err)
 					}
@@ -933,8 +937,9 @@ func (w *tableWorker) executeTask(ctx context.Context, task *lookupTableTask) er
 	if w.keepOrder {
 		task.rowIdx = make([]int, 0, len(task.rows))
 		for i := range task.rows {
-			handle := task.rows[i].GetInt64(w.handleIdx)
-			task.rowIdx = append(task.rowIdx, task.indexOrder[handle])
+			handle := kv.IntHandle(task.rows[i].GetInt64(w.handleIdx))
+			rowIdx, _ := task.indexOrder.Get(handle)
+			task.rowIdx = append(task.rowIdx, rowIdx.(int))
 		}
 		memUsage = int64(cap(task.rowIdx) * 4)
 		task.memUsage += memUsage
@@ -944,16 +949,16 @@ func (w *tableWorker) executeTask(ctx context.Context, task *lookupTableTask) er
 
 	if handleCnt != len(task.rows) {
 		if len(w.idxLookup.tblPlans) == 1 {
-			obtainedHandlesMap := make(map[int64]struct{}, len(task.rows))
+			obtainedHandlesMap := kv.NewHandleMap()
 			for _, row := range task.rows {
-				handle := row.GetInt64(w.handleIdx)
-				obtainedHandlesMap[handle] = struct{}{}
+				handle := kv.IntHandle(row.GetInt64(w.handleIdx))
+				obtainedHandlesMap.Set(handle, true)
 			}
 
 			logutil.Logger(ctx).Error("inconsistent index handles", zap.String("index", w.idxLookup.index.Name.O),
 				zap.Int("index_cnt", handleCnt), zap.Int("table_cnt", len(task.rows)),
-				zap.Int64s("missing_handles", GetLackHandles(task.handles, obtainedHandlesMap)),
-				zap.Int64s("total_handles", task.handles))
+				zap.String("missing_handles", fmt.Sprint(GetLackHandles(task.handles, obtainedHandlesMap))),
+				zap.String("total_handles", fmt.Sprint(task.handles)))
 
 			// table scan in double read can never has conditions according to convertToIndexScan.
 			// if this table scan has no condition, the number of rows it returns must equal to the length of handles.
@@ -966,14 +971,14 @@ func (w *tableWorker) executeTask(ctx context.Context, task *lookupTableTask) er
 }
 
 // GetLackHandles gets the handles in expectedHandles but not in obtainedHandlesMap.
-func GetLackHandles(expectedHandles []int64, obtainedHandlesMap map[int64]struct{}) []int64 {
-	diffCnt := len(expectedHandles) - len(obtainedHandlesMap)
-	diffHandles := make([]int64, 0, diffCnt)
+func GetLackHandles(expectedHandles []kv.Handle, obtainedHandlesMap *kv.HandleMap) []kv.Handle {
+	diffCnt := len(expectedHandles) - obtainedHandlesMap.Len()
+	diffHandles := make([]kv.Handle, 0, diffCnt)
 	var cnt int
 	for _, handle := range expectedHandles {
 		isExist := false
-		if _, ok := obtainedHandlesMap[handle]; ok {
-			delete(obtainedHandlesMap, handle)
+		if _, ok := obtainedHandlesMap.Get(handle); ok {
+			obtainedHandlesMap.Delete(handle)
 			isExist = true
 		}
 		if !isExist {

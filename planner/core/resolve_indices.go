@@ -300,6 +300,10 @@ func (p *PhysicalIndexLookUpReader) ResolveIndices() (err error) {
 
 // ResolveIndices implements Plan interface.
 func (p *PhysicalIndexMergeReader) ResolveIndices() (err error) {
+	err = resolveIndicesForVirtualColumn(p.tablePlan.Schema().Columns, p.schema)
+	if err != nil {
+		return err
+	}
 	if p.tablePlan != nil {
 		err = p.tablePlan.ResolveIndices()
 		if err != nil {
@@ -339,6 +343,12 @@ func (p *basePhysicalAgg) ResolveIndices() (err error) {
 	for _, aggFun := range p.AggFuncs {
 		for i, arg := range aggFun.Args {
 			aggFun.Args[i], err = arg.ResolveIndices(p.children[0].Schema())
+			if err != nil {
+				return err
+			}
+		}
+		for _, byItem := range aggFun.OrderByItems {
+			byItem.Expr, err = byItem.Expr.ResolveIndices(p.children[0].Schema())
 			if err != nil {
 				return err
 			}
@@ -422,6 +432,22 @@ func (p *PhysicalWindow) ResolveIndices() (err error) {
 }
 
 // ResolveIndices implements Plan interface.
+func (p *PhysicalShuffle) ResolveIndices() (err error) {
+	err = p.basePhysicalPlan.ResolveIndices()
+	if err != nil {
+		return err
+	}
+	for i := range p.HashByItems {
+		// "Shuffle" get value of items from `DataSource`, other than children[0].
+		p.HashByItems[i], err = p.HashByItems[i].ResolveIndices(p.DataSource.Schema())
+		if err != nil {
+			return err
+		}
+	}
+	return err
+}
+
+// ResolveIndices implements Plan interface.
 func (p *PhysicalTopN) ResolveIndices() (err error) {
 	err = p.basePhysicalPlan.ResolveIndices()
 	if err != nil {
@@ -442,12 +468,20 @@ func (p *PhysicalApply) ResolveIndices() (err error) {
 	if err != nil {
 		return err
 	}
+	// p.OuterSchema may have duplicated CorrelatedColumns,
+	// we deduplicate it here.
+	dedupCols := make(map[int64]*expression.CorrelatedColumn, len(p.OuterSchema))
 	for _, col := range p.OuterSchema {
+		dedupCols[col.UniqueID] = col
+	}
+	p.OuterSchema = make([]*expression.CorrelatedColumn, 0, len(dedupCols))
+	for _, col := range dedupCols {
 		newCol, err := col.Column.ResolveIndices(p.children[0].Schema())
 		if err != nil {
 			return err
 		}
 		col.Column = *newCol.(*expression.Column)
+		p.OuterSchema = append(p.OuterSchema, col)
 	}
 	// Resolve index for equal conditions again, because apply is different from
 	// hash join on the fact that equal conditions are evaluated against the join result,

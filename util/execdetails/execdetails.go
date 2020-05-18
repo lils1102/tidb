@@ -34,6 +34,7 @@ var CommitDetailCtxKey = commitDetailCtxKeyType{}
 // ExecDetails contains execution detail information.
 type ExecDetails struct {
 	CalleeAddress    string
+	CopTime          time.Duration
 	ProcessTime      time.Duration
 	WaitTime         time.Duration
 	BackoffTime      time.Duration
@@ -48,13 +49,13 @@ type ExecDetails struct {
 
 // CommitDetails contains commit detail information.
 type CommitDetails struct {
-	GetCommitTsTime    time.Duration
-	PrewriteTime       time.Duration
-	BinlogPrewriteTime time.Duration
-	CommitTime         time.Duration
-	LocalLatchTime     time.Duration
-	CommitBackoffTime  int64
-	Mu                 struct {
+	GetCommitTsTime        time.Duration
+	PrewriteTime           time.Duration
+	WaitPrewriteBinlogTime time.Duration
+	CommitTime             time.Duration
+	LocalLatchTime         time.Duration
+	CommitBackoffTime      int64
+	Mu                     struct {
 		sync.Mutex
 		BackoffTypes []fmt.Stringer
 	}
@@ -66,6 +67,8 @@ type CommitDetails struct {
 }
 
 const (
+	// CopTimeStr represents the sum of cop-task time spend in TiDB distSQL.
+	CopTimeStr = "Cop_time"
 	// ProcessTimeStr represents the sum of process time of all the coprocessor tasks.
 	ProcessTimeStr = "Process_time"
 	// WaitTimeStr means the time of all coprocessor wait.
@@ -82,8 +85,8 @@ const (
 	ProcessKeysStr = "Process_keys"
 	// PreWriteTimeStr means the time of pre-write.
 	PreWriteTimeStr = "Prewrite_time"
-	// BinlogPrewriteTimeStr means the time of binlog prewrite
-	BinlogPrewriteTimeStr = "Binlog_prewrite_time"
+	// WaitPrewriteBinlogTimeStr means the time of waiting prewrite binlog finished when transaction committing.
+	WaitPrewriteBinlogTimeStr = "Wait_prewrite_binlog_time"
 	// CommitTimeStr means the time of commit.
 	CommitTimeStr = "Commit_time"
 	// GetCommitTSTimeStr means the time of getting commit ts.
@@ -108,7 +111,10 @@ const (
 
 // String implements the fmt.Stringer interface.
 func (d ExecDetails) String() string {
-	parts := make([]string, 0, 6)
+	parts := make([]string, 0, 8)
+	if d.CopTime > 0 {
+		parts = append(parts, CopTimeStr+": "+strconv.FormatFloat(d.CopTime.Seconds(), 'f', -1, 64))
+	}
 	if d.ProcessTime > 0 {
 		parts = append(parts, ProcessTimeStr+": "+strconv.FormatFloat(d.ProcessTime.Seconds(), 'f', -1, 64))
 	}
@@ -135,8 +141,8 @@ func (d ExecDetails) String() string {
 		if commitDetails.PrewriteTime > 0 {
 			parts = append(parts, PreWriteTimeStr+": "+strconv.FormatFloat(commitDetails.PrewriteTime.Seconds(), 'f', -1, 64))
 		}
-		if commitDetails.BinlogPrewriteTime > 0 {
-			parts = append(parts, BinlogPrewriteTimeStr+": "+strconv.FormatFloat(commitDetails.BinlogPrewriteTime.Seconds(), 'f', -1, 64))
+		if commitDetails.WaitPrewriteBinlogTime > 0 {
+			parts = append(parts, WaitPrewriteBinlogTimeStr+": "+strconv.FormatFloat(commitDetails.WaitPrewriteBinlogTime.Seconds(), 'f', -1, 64))
 		}
 		if commitDetails.CommitTime > 0 {
 			parts = append(parts, CommitTimeStr+": "+strconv.FormatFloat(commitDetails.CommitTime.Seconds(), 'f', -1, 64))
@@ -180,11 +186,14 @@ func (d ExecDetails) String() string {
 // ToZapFields wraps the ExecDetails as zap.Fields.
 func (d ExecDetails) ToZapFields() (fields []zap.Field) {
 	fields = make([]zap.Field, 0, 16)
+	if d.CopTime > 0 {
+		fields = append(fields, zap.String(strings.ToLower(CopTimeStr), strconv.FormatFloat(d.CopTime.Seconds(), 'f', -1, 64)+"s"))
+	}
 	if d.ProcessTime > 0 {
 		fields = append(fields, zap.String(strings.ToLower(ProcessTimeStr), strconv.FormatFloat(d.ProcessTime.Seconds(), 'f', -1, 64)+"s"))
 	}
 	if d.WaitTime > 0 {
-		fields = append(fields, zap.String(strings.ToLower(WaitTimeStr), strconv.FormatFloat(d.ProcessTime.Seconds(), 'f', -1, 64)+"s"))
+		fields = append(fields, zap.String(strings.ToLower(WaitTimeStr), strconv.FormatFloat(d.WaitTime.Seconds(), 'f', -1, 64)+"s"))
 	}
 	if d.BackoffTime > 0 {
 		fields = append(fields, zap.String(strings.ToLower(BackoffTimeStr), strconv.FormatFloat(d.BackoffTime.Seconds(), 'f', -1, 64)+"s"))
@@ -264,31 +273,40 @@ func (crs *CopRuntimeStats) RecordOneCopTask(address string, summary *tipb.Execu
 			rows:    int64(*summary.NumProducedRows)})
 }
 
+// GetActRows return total rows of CopRuntimeStats.
+func (crs *CopRuntimeStats) GetActRows() (totalRows int64) {
+	for _, instanceStats := range crs.stats {
+		for _, stat := range instanceStats {
+			totalRows += stat.rows
+		}
+	}
+	return totalRows
+}
+
 func (crs *CopRuntimeStats) String() string {
 	if len(crs.stats) == 0 {
 		return ""
 	}
 
-	var totalRows, totalTasks int64
+	var totalTasks int64
 	var totalIters int32
 	procTimes := make([]time.Duration, 0, 32)
 	for _, instanceStats := range crs.stats {
 		for _, stat := range instanceStats {
 			procTimes = append(procTimes, time.Duration(stat.consume)*time.Nanosecond)
-			totalRows += stat.rows
 			totalIters += stat.loop
 			totalTasks++
 		}
 	}
 
 	if totalTasks == 1 {
-		return fmt.Sprintf("time:%v, loops:%d, rows:%d", procTimes[0], totalIters, totalRows)
+		return fmt.Sprintf("time:%v, loops:%d", procTimes[0], totalIters)
 	}
 
 	n := len(procTimes)
 	sort.Slice(procTimes, func(i, j int) bool { return procTimes[i] < procTimes[j] })
-	return fmt.Sprintf("proc max:%v, min:%v, p80:%v, p95:%v, rows:%v, iters:%v, tasks:%v",
-		procTimes[n-1], procTimes[0], procTimes[n*4/5], procTimes[n*19/20], totalRows, totalIters, totalTasks)
+	return fmt.Sprintf("proc max:%v, min:%v, p80:%v, p95:%v, iters:%v, tasks:%v",
+		procTimes[n-1], procTimes[0], procTimes[n*4/5], procTimes[n*19/20], totalIters, totalTasks)
 }
 
 // ReaderRuntimeStats collects stats for TableReader, IndexReader and IndexLookupReader
@@ -357,9 +375,13 @@ type RuntimeStats struct {
 	// executor return row count.
 	rows int64
 
+	// protect concurrency
 	mu sync.Mutex
 	// executor concurrency information
 	concurrency []concurrencyInfo
+
+	// additional information for executors
+	additionalInfo string
 }
 
 // NewRuntimeStatsColl creates new executor collector.
@@ -452,8 +474,20 @@ func (e *RuntimeStats) SetConcurrencyInfo(name string, num int) {
 	e.concurrency = append(e.concurrency, concurrencyInfo{concurrencyName: name, concurrencyNum: num})
 }
 
+// SetAdditionalInfo sets the additional information.
+func (e *RuntimeStats) SetAdditionalInfo(info string) {
+	e.mu.Lock()
+	e.additionalInfo = info
+	e.mu.Unlock()
+}
+
+// GetActRows return rows of CopRuntimeStats.
+func (e *RuntimeStats) GetActRows() int64 {
+	return e.rows
+}
+
 func (e *RuntimeStats) String() string {
-	result := fmt.Sprintf("time:%v, loops:%d, rows:%d", time.Duration(e.consume), e.loop, e.rows)
+	result := fmt.Sprintf("time:%v, loops:%d", time.Duration(e.consume), e.loop)
 	if len(e.concurrency) > 0 {
 		for _, concurrency := range e.concurrency {
 			if concurrency.concurrencyNum > 0 {
@@ -462,6 +496,9 @@ func (e *RuntimeStats) String() string {
 				result += fmt.Sprintf(", %s:OFF", concurrency.concurrencyName)
 			}
 		}
+	}
+	if len(e.additionalInfo) > 0 {
+		result += ", " + e.additionalInfo
 	}
 	return result
 }

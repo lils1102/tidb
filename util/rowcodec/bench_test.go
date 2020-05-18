@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/pingcap/parser/mysql"
+	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
@@ -80,13 +81,14 @@ func BenchmarkDecode(b *testing.B) {
 			Flen:    tp.Flen,
 			Decimal: tp.Decimal,
 			Elems:   tp.Elems,
+			Collate: tp.Collate,
 		}
 	}
-	decoder := rowcodec.NewChunkDecoder(cols, -1, nil, time.Local)
+	decoder := rowcodec.NewChunkDecoder(cols, []int64{-1}, nil, time.Local)
 	chk := chunk.NewChunkWithCapacity(tps, 1)
 	for i := 0; i < b.N; i++ {
 		chk.Reset()
-		err = decoder.DecodeToChunk(xRowData, 1, chk)
+		err = decoder.DecodeToChunk(xRowData, kv.IntHandle(1), chk)
 		if err != nil {
 			b.Fatal(err)
 		}

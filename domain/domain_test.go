@@ -17,6 +17,10 @@ import (
 	"context"
 	"crypto/tls"
 	"math"
+	"net"
+	"runtime"
+	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,9 +30,9 @@ import (
 	"github.com/pingcap/failpoint"
 	"github.com/pingcap/parser/ast"
 	"github.com/pingcap/parser/model"
-	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/ddl"
 	"github.com/pingcap/tidb/domain/infosync"
+	"github.com/pingcap/tidb/errno"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/meta"
 	"github.com/pingcap/tidb/metrics"
@@ -73,10 +77,78 @@ func (mebd *mockEtcdBackend) StartGCWorker() error {
 	panic("not implemented")
 }
 
+// ETCD use ip:port as unix socket address, however this address is invalid on windows.
+// We have to skip some of the test in such case.
+// https://github.com/etcd-io/etcd/blob/f0faa5501d936cd8c9f561bb9d1baca70eb67ab1/pkg/types/urls.go#L42
+func unixSocketAvailable() bool {
+	c, err := net.Listen("unix", "127.0.0.1:0")
+	if err == nil {
+		c.Close()
+		return true
+	}
+	return false
+}
+
+// For debug only, will be removed later.
+func interestingGoroutines() (gs []string) {
+	buf := make([]byte, 2<<20)
+	buf = buf[:runtime.Stack(buf, true)]
+	for _, g := range strings.Split(string(buf), "\n\n") {
+		sl := strings.SplitN(g, "\n", 2)
+		if len(sl) != 2 {
+			continue
+		}
+		stack := strings.TrimSpace(sl[1])
+		if stack == "" ||
+			strings.Contains(stack, "created by github.com/pingcap/tidb.init") ||
+			strings.Contains(stack, "testing.RunTests") ||
+			strings.Contains(stack, "check.(*resultTracker).start") ||
+			strings.Contains(stack, "check.(*suiteRunner).runFunc") ||
+			strings.Contains(stack, "check.(*suiteRunner).parallelRun") ||
+			strings.Contains(stack, "localstore.(*dbStore).scheduler") ||
+			strings.Contains(stack, "tikv.(*noGCHandler).Start") ||
+			strings.Contains(stack, "ddl.(*ddl).start") ||
+			strings.Contains(stack, "ddl.(*delRange).startEmulator") ||
+			strings.Contains(stack, "domain.NewDomain") ||
+			strings.Contains(stack, "testing.(*T).Run") ||
+			strings.Contains(stack, "domain.(*Domain).LoadPrivilegeLoop") ||
+			strings.Contains(stack, "domain.(*Domain).UpdateTableStatsLoop") ||
+			strings.Contains(stack, "testing.Main(") ||
+			strings.Contains(stack, "runtime.goexit") ||
+			strings.Contains(stack, "created by runtime.gc") ||
+			strings.Contains(stack, "interestingGoroutines") ||
+			strings.Contains(stack, "runtime.MHeap_Scavenger") ||
+			// these go routines are async terminated, so they may still alive after test end, thus cause
+			// false positive leak failures
+			strings.Contains(stack, "google.golang.org/grpc.(*addrConn).resetTransport") ||
+			strings.Contains(stack, "google.golang.org/grpc.(*ccBalancerWrapper).watcher") ||
+			strings.Contains(stack, "github.com/pingcap/goleveldb/leveldb/util.(*BufferPool).drain") ||
+			strings.Contains(stack, "github.com/pingcap/goleveldb/leveldb.(*DB).compactionError") ||
+			strings.Contains(stack, "github.com/pingcap/goleveldb/leveldb.(*DB).mpoolDrain") {
+			continue
+		}
+		gs = append(gs, stack)
+	}
+	sort.Strings(gs)
+	return
+}
+
 func TestInfo(t *testing.T) {
-	defer testleak.AfterTestT(t)()
+	if !unixSocketAvailable() {
+		return
+	}
+	for _, str := range interestingGoroutines() {
+		t.Logf("TestInfo: BeforeTest %s", str)
+	}
+	testleak.BeforeTest()
+	defer func() {
+		for _, str := range interestingGoroutines() {
+			t.Logf("TestInfo: AfterTest %s", str)
+		}
+		testleak.AfterTestT(t)()
+	}()
 	ddlLease := 80 * time.Millisecond
-	s, err := mockstore.NewMockTikvStore()
+	s, err := mockstore.NewMockStore()
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,6 +174,10 @@ func TestInfo(t *testing.T) {
 		ddl.WithInfoHandle(dom.infoHandle),
 		ddl.WithLease(ddlLease),
 	)
+	err = dom.ddl.Start(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	err = failpoint.Enable("github.com/pingcap/tidb/domain/MockReplaceDDL", `return(true)`)
 	if err != nil {
 		t.Fatal(err)
@@ -148,9 +224,13 @@ func TestInfo(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-dom.ddl.SchemaSyncer().Done()
+	err = failpoint.Disable("github.com/pingcap/tidb/ddl/util/ErrorMockSessionDone")
+	if err != nil {
+		t.Fatal(err)
+	}
 	time.Sleep(15 * time.Millisecond)
 	syncerStarted := false
-	for i := 0; i < 200; i++ {
+	for i := 0; i < 1000; i++ {
 		if dom.SchemaValidator.IsStarted() {
 			syncerStarted = true
 			break
@@ -159,10 +239,6 @@ func TestInfo(t *testing.T) {
 	}
 	if !syncerStarted {
 		t.Fatal("start syncer failed")
-	}
-	err = failpoint.Disable("github.com/pingcap/tidb/ddl/util/ErrorMockSessionDone")
-	if err != nil {
-		t.Fatal(err)
 	}
 	// Make sure loading schema is normal.
 	cs := &ast.CharsetOpt{
@@ -213,9 +289,11 @@ func (msm *mockSessionManager) GetProcessInfo(id uint64) (*util.ProcessInfo, boo
 
 func (msm *mockSessionManager) Kill(cid uint64, query bool) {}
 
+func (msm *mockSessionManager) UpdateTLSConfig(cfg *tls.Config) {}
+
 func (*testSuite) TestT(c *C) {
 	defer testleak.AfterTest(c)()
-	store, err := mockstore.NewMockTikvStore()
+	store, err := mockstore.NewMockStore()
 	c.Assert(err, IsNil)
 	ddlLease := 80 * time.Millisecond
 	dom := NewDomain(store, ddlLease, 0, mockFactory)
@@ -435,6 +513,6 @@ func (*testSuite) TestSessionPool(c *C) {
 }
 
 func (*testSuite) TestErrorCode(c *C) {
-	c.Assert(int(ErrInfoSchemaExpired.ToSQLError().Code), Equals, mysql.ErrInfoSchemaExpired)
-	c.Assert(int(ErrInfoSchemaChanged.ToSQLError().Code), Equals, mysql.ErrInfoSchemaChanged)
+	c.Assert(int(ErrInfoSchemaExpired.ToSQLError().Code), Equals, errno.ErrInfoSchemaExpired)
+	c.Assert(int(ErrInfoSchemaChanged.ToSQLError().Code), Equals, errno.ErrInfoSchemaChanged)
 }

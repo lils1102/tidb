@@ -24,6 +24,7 @@ import (
 	"github.com/pingcap/errors"
 	"github.com/pingcap/parser/charset"
 	"github.com/pingcap/parser/model"
+	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/sessionctx"
 	"github.com/pingcap/tidb/sessionctx/stmtctx"
@@ -31,18 +32,24 @@ import (
 	"github.com/pingcap/tidb/tablecodec"
 	"github.com/pingcap/tidb/types"
 	"github.com/pingcap/tidb/util/codec"
+	"github.com/pingcap/tidb/util/collate"
+	"github.com/pingcap/tidb/util/rowcodec"
 )
 
-// EncodeHandle encodes handle in data.
-func EncodeHandle(h int64) []byte {
+// EncodeHandleInUniqueIndexValue encodes handle in data.
+func EncodeHandleInUniqueIndexValue(h int64) []byte {
 	var data [8]byte
 	binary.BigEndian.PutUint64(data[:], uint64(h))
 	return data[:]
 }
 
-// DecodeHandle decodes handle in data.
-func DecodeHandle(data []byte) (int64, error) {
-	return int64(binary.BigEndian.Uint64(data)), nil
+// DecodeHandleInUniqueIndexValue decodes handle in data.
+func DecodeHandleInUniqueIndexValue(data []byte) (int64, error) {
+	dLen := len(data)
+	if dLen <= tablecodec.MaxOldEncodeValueLen {
+		return int64(binary.BigEndian.Uint64(data)), nil
+	}
+	return int64(binary.BigEndian.Uint64(data[dLen-int(data[0]):])), nil
 }
 
 // indexIter is for KV store index iterator.
@@ -61,43 +68,56 @@ func (c *indexIter) Close() {
 }
 
 // Next returns current key and moves iterator to the next step.
-func (c *indexIter) Next() (val []types.Datum, h int64, err error) {
+func (c *indexIter) Next() (val []types.Datum, h kv.Handle, err error) {
 	if !c.it.Valid() {
-		return nil, 0, errors.Trace(io.EOF)
+		return nil, nil, errors.Trace(io.EOF)
 	}
 	if !c.it.Key().HasPrefix(c.prefix) {
-		return nil, 0, errors.Trace(io.EOF)
+		return nil, nil, errors.Trace(io.EOF)
 	}
 	// get indexedValues
 	buf := c.it.Key()[len(c.prefix):]
 	vv, err := codec.Decode(buf, len(c.idx.idxInfo.Columns))
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
 	if len(vv) > len(c.idx.idxInfo.Columns) {
-		h = vv[len(vv)-1].GetInt64()
+		h = kv.IntHandle(vv[len(vv)-1].GetInt64())
 		val = vv[0 : len(vv)-1]
 	} else {
 		// If the index is unique and the value isn't nil, the handle is in value.
-		h, err = DecodeHandle(c.it.Value())
+		var iv int64
+		iv, err = DecodeHandleInUniqueIndexValue(c.it.Value())
 		if err != nil {
-			return nil, 0, err
+			return nil, nil, err
 		}
+		h = kv.IntHandle(iv)
 		val = vv
 	}
 	// update new iter to next
 	err = c.it.Next()
 	if err != nil {
-		return nil, 0, err
+		return nil, nil, err
 	}
 	return
 }
 
 // index is the data structure for index data in the KV store.
 type index struct {
-	idxInfo *model.IndexInfo
-	tblInfo *model.TableInfo
-	prefix  kv.Key
+	idxInfo                *model.IndexInfo
+	tblInfo                *model.TableInfo
+	prefix                 kv.Key
+	containNonBinaryString bool
+}
+
+func (c *index) checkContainNonBinaryString() bool {
+	for _, idxCol := range c.idxInfo.Columns {
+		col := c.tblInfo.Columns[idxCol.Offset]
+		if col.EvalType() == types.ETString && !mysql.HasBinaryFlag(col.Flag) {
+			return true
+		}
+	}
+	return false
 }
 
 // NewIndex builds a new Index object.
@@ -108,6 +128,7 @@ func NewIndex(physicalID int64, tblInfo *model.TableInfo, indexInfo *model.Index
 		// The prefix can't encode from tblInfo.ID, because table partition may change the id to partition id.
 		prefix: tablecodec.EncodeTableIndexPrefix(physicalID, indexInfo.ID),
 	}
+	index.containNonBinaryString = index.checkContainNonBinaryString()
 	return index
 }
 
@@ -139,7 +160,7 @@ func TruncateIndexValuesIfNeeded(tblInfo *model.TableInfo, idxInfo *model.IndexI
 					rs := bytes.Runes(colValue)
 					truncateStr := string(rs[:ic.Length])
 					// truncate value and limit its length
-					v.SetString(truncateStr)
+					v.SetString(truncateStr, tblInfo.Columns[ic.Offset].Collate)
 					if origKind == types.KindBytes {
 						v.SetBytes(v.GetBytes())
 					}
@@ -148,7 +169,7 @@ func TruncateIndexValuesIfNeeded(tblInfo *model.TableInfo, idxInfo *model.IndexI
 				// truncate value and limit its length
 				v.SetBytes(colValue[:ic.Length])
 				if origKind == types.KindString {
-					v.SetString(v.GetString())
+					v.SetString(v.GetString(), tblInfo.Columns[ic.Offset].Collate)
 				}
 			}
 		}
@@ -159,7 +180,7 @@ func TruncateIndexValuesIfNeeded(tblInfo *model.TableInfo, idxInfo *model.IndexI
 
 // GenIndexKey generates storage key for index values. Returned distinct indicates whether the
 // indexed values should be distinct in storage (i.e. whether handle is encoded in the key).
-func (c *index) GenIndexKey(sc *stmtctx.StatementContext, indexedValues []types.Datum, h int64, buf []byte) (key []byte, distinct bool, err error) {
+func (c *index) GenIndexKey(sc *stmtctx.StatementContext, indexedValues []types.Datum, h kv.Handle, buf []byte) (key []byte, distinct bool, err error) {
 	if c.idxInfo.Unique {
 		// See https://dev.mysql.com/doc/refman/5.7/en/create-index.html
 		// A UNIQUE index creates a constraint such that all values in the index must be distinct.
@@ -180,11 +201,15 @@ func (c *index) GenIndexKey(sc *stmtctx.StatementContext, indexedValues []types.
 	key = c.getIndexKeyBuf(buf, len(c.prefix)+len(indexedValues)*9+9)
 	key = append(key, []byte(c.prefix)...)
 	key, err = codec.EncodeKey(sc, key, indexedValues...)
-	if !distinct && err == nil {
-		key, err = codec.EncodeKey(sc, key, types.NewDatum(h))
-	}
 	if err != nil {
 		return nil, false, err
+	}
+	if !distinct && h != nil {
+		if h.IsInt() {
+			key, err = codec.EncodeKey(sc, key, types.NewDatum(h.IntValue()))
+		} else {
+			key = append(key, h.Encoded()...)
+		}
 	}
 	return
 }
@@ -192,7 +217,94 @@ func (c *index) GenIndexKey(sc *stmtctx.StatementContext, indexedValues []types.
 // Create creates a new entry in the kvIndex data.
 // If the index is unique and there is an existing entry with the same key,
 // Create will return the existing entry's handle as the first return value, ErrKeyExists as the second return value.
-func (c *index) Create(sctx sessionctx.Context, rm kv.RetrieverMutator, indexedValues []types.Datum, h int64, opts ...table.CreateIdxOptFunc) (int64, error) {
+// Value layout:
+//		+--With Restore Data(for indices on string columns)
+//		|  |
+//		|  +--Non Unique (TailLen = len(PaddingData) + len(Flag), TailLen < 8 always)
+//		|  |  |
+//		|  |  +--Without Untouched Flag:
+//		|  |  |
+//		|  |  |  Layout: TailLen |      RestoreData  |      PaddingData
+//		|  |  |  Length: 1       | size(RestoreData) | size(paddingData)
+//		|  |  |
+//		|  |  |  The length >= 10 always because of padding.
+//		|  |  |
+//		|  |  +--With Untouched Flag:
+//		|  |
+//		|  |     Layout: TailLen |    RestoreData    |      PaddingData  | Flag
+//		|  |     Length: 1       | size(RestoreData) | size(paddingData) |  1
+//		|  |
+//		|  |     The length >= 11 always because of padding.
+//		|  |
+//		|  +--Unique Common Handle
+//		|  |  |
+//		|  |  +--Without Untouched Flag:
+//		|  |  |
+//		|  |  |  Layout: 0x00 | CHandle Flag | CHandle Len | CHandle       | RestoreData
+//		|  |  |  Length: 1    | 1            | 2           | size(CHandle) | size(RestoreData)
+//		|  |  |
+//		|  |  |  The length > 10 always because of CHandle size.
+//		|  |  |
+//		|  |  +--With Untouched Flag:
+//		|  |
+//		|  |     Layout: 0x01 | CHandle Flag | CHandle Len | CHandle       | RestoreData       | Flag
+//		|  |     Length: 1    | 1            | 2           | size(CHandle) | size(RestoreData) | 1
+//		|  |
+//		|  |     The length > 10 always because of CHandle size.
+//		|  |
+//		|  +--Unique Integer Handle (TailLen = len(Handle) + len(Flag), TailLen == 8 || TailLen == 9)
+//		|     |
+//		|     +--Without Untouched Flag:
+//		|     |
+//		|     |  Layout: 0x08 |    RestoreData    |  Handle
+//		|     |  Length: 1    | size(RestoreData) |   8
+//		|     |
+//		|     |  The length >= 10 always since size(RestoreData) > 0.
+//		|     |
+//		|     +--With Untouched Flag:
+//		|
+//		|        Layout: 0x09 |      RestoreData  |  Handle  | Flag
+//		|        Length: 1    | size(RestoreData) |   8      | 1
+//		|
+//		|   	 The length >= 11 always since size(RestoreData) > 0.
+//		|
+//		+--Without Restore Data
+//		|
+//		+--Non Unique
+//		|  |
+//		|  +--Without Untouched Flag:
+//		|  |
+//		|  |  Layout: '0'
+//		|  |  Length:  1
+//		|  |
+//		|  +--With Untouched Flag:
+//		|
+//		|     Layout: Flag
+//		|     Length:  1
+//		+--Unique Common Handle
+//		|  |
+//		|  +--Without Untouched Flag:
+//		|  |
+//		|  |  Layout: 0x00 | CHandle Flag | CHandle Len | CHandle
+//      |  |  Length: 1    | 1            | 2           | size(CHandle)
+//		|  |
+//		|  +--With Untouched Flag:
+//		|
+//		|     Layout: 0x01 | CHandle Flag | CHandle Len | CHandle       | Flag
+//		|     Length: 1    | 1            | 2           | size(CHandle) | 1
+//		|
+//		+--Unique Integer Handle
+//		|
+//		+--Without Untouched Flag:
+//		|
+//		|  Layout: Handle
+//		|  Length:   8
+//		|
+//		+--With Untouched Flag:
+//
+//		Layout: Handle | Flag
+//		Length:   8    |  1
+func (c *index) Create(sctx sessionctx.Context, rm kv.RetrieverMutator, indexedValues []types.Datum, h kv.Handle, opts ...table.CreateIdxOptFunc) (kv.Handle, error) {
 	var opt table.CreateIdxOpt
 	for _, fn := range opts {
 		fn(&opt)
@@ -202,46 +314,91 @@ func (c *index) Create(sctx sessionctx.Context, rm kv.RetrieverMutator, indexedV
 	skipCheck := vars.StmtCtx.BatchCheck
 	key, distinct, err := c.GenIndexKey(vars.StmtCtx, indexedValues, h, writeBufs.IndexKeyBuf)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
 
 	ctx := opt.Ctx
 	if opt.Untouched {
 		txn, err1 := sctx.Txn(true)
 		if err1 != nil {
-			return 0, err1
+			return nil, err1
 		}
 		// If the index kv was untouched(unchanged), and the key/value already exists in mem-buffer,
 		// should not overwrite the key with un-commit flag.
 		// So if the key exists, just do nothing and return.
 		_, err = txn.GetMemBuffer().Get(ctx, key)
 		if err == nil {
-			return 0, nil
+			return nil, nil
 		}
 	}
 
 	// save the key buffer to reuse.
 	writeBufs.IndexKeyBuf = key
-	if !distinct {
-		// non-unique index doesn't need store value, write a '0' to reduce space
-		value := []byte{'0'}
-		if opt.Untouched {
-			value[0] = kv.UnCommitIndexKVFlag
+	var idxVal []byte
+	if collate.NewCollationEnabled() && c.containNonBinaryString {
+		colIds := make([]int64, len(c.idxInfo.Columns))
+		for i, col := range c.idxInfo.Columns {
+			colIds[i] = c.tblInfo.Columns[col.Offset].ID
 		}
-		err = rm.Set(key, value)
-		return 0, err
+		rd := rowcodec.Encoder{Enable: true}
+		rowRestoredValue, err := rd.Encode(sctx.GetSessionVars().StmtCtx, colIds, indexedValues, nil)
+		if err != nil {
+			return nil, err
+		}
+		// tailLen(1) + commonHandleFlag(1) + handleLen(2) + handle + restoredValue
+		idxValCap := 1 + 1 + 2 + h.Len() + len(rowRestoredValue)
+		idxVal = make([]byte, 1, idxValCap)
+		if !h.IsInt() && distinct {
+			idxVal = encodeCommonHandle(idxVal, h)
+		}
+		idxVal = append(idxVal, rowRestoredValue...)
+		tailLen := 0
+		if h.IsInt() && distinct {
+			// The len of the idxVal is always >= 10 since len (restoredValue) > 0.
+			tailLen += 8
+			idxVal = append(idxVal, EncodeHandleInUniqueIndexValue(h.IntValue())...)
+		} else if len(idxVal) < 10 {
+			// Padding the len to 10
+			paddingLen := 10 - len(idxVal)
+			tailLen += paddingLen
+			idxVal = append(idxVal, bytes.Repeat([]byte{0x0}, paddingLen)...)
+		}
+		if opt.Untouched {
+			// If index is untouched and fetch here means the key is exists in TiKV, but not in txn mem-buffer,
+			// then should also write the untouched index key/value to mem-buffer to make sure the data
+			// is consistent with the index in txn mem-buffer.
+			tailLen += 1
+			idxVal = append(idxVal, kv.UnCommitIndexKVFlag)
+		}
+		idxVal[0] = byte(tailLen)
+	} else {
+		idxVal = make([]byte, 0)
+		if distinct {
+			if h.IsInt() {
+				idxVal = EncodeHandleInUniqueIndexValue(h.IntValue())
+			} else {
+				if opt.Untouched {
+					idxVal = append(idxVal, 1)
+				} else {
+					idxVal = append(idxVal, 0)
+				}
+				idxVal = encodeCommonHandle(idxVal, h)
+			}
+		}
+		if opt.Untouched {
+			// If index is untouched and fetch here means the key is exists in TiKV, but not in txn mem-buffer,
+			// then should also write the untouched index key/value to mem-buffer to make sure the data
+			// is consistent with the index in txn mem-buffer.
+			idxVal = append(idxVal, kv.UnCommitIndexKVFlag)
+		}
+		if len(idxVal) == 0 {
+			idxVal = []byte{'0'}
+		}
 	}
 
-	if skipCheck || opt.Untouched {
-		value := EncodeHandle(h)
-		// If index is untouched and fetch here means the key is exists in TiKV, but not in txn mem-buffer,
-		// then should also write the untouched index key/value to mem-buffer to make sure the data
-		// is consistent with the index in txn mem-buffer.
-		if opt.Untouched {
-			value = append(value, kv.UnCommitIndexKVFlag)
-		}
-		err = rm.Set(key, value)
-		return 0, err
+	if !distinct || skipCheck || opt.Untouched {
+		err = rm.Set(key, idxVal)
+		return nil, err
 	}
 
 	if ctx != nil {
@@ -254,23 +411,32 @@ func (c *index) Create(sctx sessionctx.Context, rm kv.RetrieverMutator, indexedV
 		ctx = context.TODO()
 	}
 
-	var value []byte
-	value, err = rm.Get(ctx, key)
-	if kv.IsErrNotFound(err) {
-		v := EncodeHandle(h)
-		err = rm.Set(key, v)
-		return 0, err
+	value, err := rm.Get(ctx, key)
+	if err != nil {
+		if kv.IsErrNotFound(err) {
+			err = rm.Set(key, idxVal)
+			return nil, err
+		}
+		return nil, err
 	}
 
-	handle, err := DecodeHandle(value)
+	handle, err := DecodeHandleInUniqueIndexValue(value)
 	if err != nil {
-		return 0, err
+		return nil, err
 	}
-	return handle, kv.ErrKeyExists
+	return kv.IntHandle(handle), kv.ErrKeyExists
+}
+
+func encodeCommonHandle(idxVal []byte, h kv.Handle) []byte {
+	idxVal = append(idxVal, tablecodec.CommonHandleFlag)
+	hLen := uint16(len(h.Encoded()))
+	idxVal = append(idxVal, byte(hLen>>8), byte(hLen))
+	idxVal = append(idxVal, h.Encoded()...)
+	return idxVal
 }
 
 // Delete removes the entry for handle h and indexdValues from KV index.
-func (c *index) Delete(sc *stmtctx.StatementContext, m kv.Mutator, indexedValues []types.Datum, h int64) error {
+func (c *index) Delete(sc *stmtctx.StatementContext, m kv.Mutator, indexedValues []types.Datum, h kv.Handle) error {
 	key, _, err := c.GenIndexKey(sc, indexedValues, h, nil)
 	if err != nil {
 		return err
@@ -306,7 +472,7 @@ func (c *index) Drop(rm kv.RetrieverMutator) error {
 
 // Seek searches KV index for the entry with indexedValues.
 func (c *index) Seek(sc *stmtctx.StatementContext, r kv.Retriever, indexedValues []types.Datum) (iter table.IndexIterator, hit bool, err error) {
-	key, _, err := c.GenIndexKey(sc, indexedValues, 0, nil)
+	key, _, err := c.GenIndexKey(sc, indexedValues, nil, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -334,28 +500,29 @@ func (c *index) SeekFirst(r kv.Retriever) (iter table.IndexIterator, err error) 
 	return &indexIter{it: it, idx: c, prefix: c.prefix}, nil
 }
 
-func (c *index) Exist(sc *stmtctx.StatementContext, rm kv.RetrieverMutator, indexedValues []types.Datum, h int64) (bool, int64, error) {
+func (c *index) Exist(sc *stmtctx.StatementContext, rm kv.RetrieverMutator, indexedValues []types.Datum, h kv.Handle) (bool, kv.Handle, error) {
 	key, distinct, err := c.GenIndexKey(sc, indexedValues, h, nil)
 	if err != nil {
-		return false, 0, err
+		return false, nil, err
 	}
 
 	value, err := rm.Get(context.TODO(), key)
 	if kv.IsErrNotFound(err) {
-		return false, 0, nil
+		return false, nil, nil
 	}
 	if err != nil {
-		return false, 0, err
+		return false, nil, err
 	}
 
 	// For distinct index, the value of key is handle.
 	if distinct {
-		handle, err := DecodeHandle(value)
+		var iv int64
+		iv, err := DecodeHandleInUniqueIndexValue(value)
 		if err != nil {
-			return false, 0, err
+			return false, nil, err
 		}
-
-		if handle != h {
+		handle := kv.IntHandle(iv)
+		if !handle.Equal(h) {
 			return true, handle, kv.ErrKeyExists
 		}
 

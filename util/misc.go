@@ -15,11 +15,16 @@ package util
 
 import (
 	"crypto/tls"
+	"crypto/x509"
 	"crypto/x509/pkix"
 	"fmt"
+	"io/ioutil"
+	"net/http"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/pingcap/errors"
@@ -27,8 +32,11 @@ import (
 	"github.com/pingcap/parser/model"
 	"github.com/pingcap/parser/mysql"
 	"github.com/pingcap/parser/terror"
+	"github.com/pingcap/tidb/config"
+	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/util/collate"
 	"github.com/pingcap/tidb/util/logutil"
-	"github.com/uber-go/atomic"
+	"github.com/pingcap/tipb/go-tipb"
 	"go.uber.org/zap"
 )
 
@@ -40,9 +48,6 @@ const (
 	// GCTimeFormat is the format that gc_worker used to store times.
 	GCTimeFormat = "20060102-15:04:05 -0700"
 )
-
-// EnablePProfSQLCPU control whether collect pprof cpu in SQL level.
-var EnablePProfSQLCPU = atomic.NewBool(false)
 
 // RunWithRetry will run the f with backoff and retry.
 // retryCnt: Max retry count
@@ -88,6 +93,34 @@ func WithRecovery(exec func(), recoverFn func(r interface{})) {
 		}
 	}()
 	exec()
+}
+
+// Recover includes operations such as recovering, clearing，and printing information.
+// It will dump current goroutine stack into log if catch any recover result.
+//   metricsLabel: The label of PanicCounter metrics.
+//   funcInfo:     Some information for the panic function.
+//   recoverFn:    Handler will be called after recover and before dump stack, passing `nil` means noop.
+//   quit:         If this value is true, the current program exits after recovery.
+func Recover(metricsLabel, funcInfo string, recoverFn func(), quit bool) {
+	r := recover()
+	if r == nil {
+		return
+	}
+
+	if recoverFn != nil {
+		recoverFn()
+	}
+	logutil.BgLogger().Error("panic in the recoverable goroutine",
+		zap.String("label", metricsLabel),
+		zap.String("funcInfo", funcInfo),
+		zap.Reflect("r", r),
+		zap.String("stack", string(GetStack())))
+	metrics.PanicCounter.WithLabelValues(metricsLabel).Inc()
+	if quit {
+		// Wait for metrics to be pushed.
+		time.Sleep(time.Second * 15)
+		os.Exit(1)
+	}
 }
 
 // CompatibleParseGCTime parses a string with `GCTimeFormat` and returns a time.Time. If `value` can't be parsed as that
@@ -146,17 +179,14 @@ var (
 	InformationSchemaName = model.NewCIStr("INFORMATION_SCHEMA")
 	// PerformanceSchemaName is the `PERFORMANCE_SCHEMA` database name.
 	PerformanceSchemaName = model.NewCIStr("PERFORMANCE_SCHEMA")
-	// MetricSchemaName is the `METRIC_SCHEMA` database name.
-	MetricSchemaName = model.NewCIStr("METRIC_SCHEMA")
-	// InspectionSchemaName is the `INSPECTION_SCHEMA` database name
-	InspectionSchemaName = model.NewCIStr("INSPECTION_SCHEMA")
+	// MetricSchemaName is the `METRICS_SCHEMA` database name.
+	MetricSchemaName = model.NewCIStr("METRICS_SCHEMA")
 )
 
 // IsMemOrSysDB uses to check whether dbLowerName is memory database or system database.
 func IsMemOrSysDB(dbLowerName string) bool {
 	switch dbLowerName {
 	case InformationSchemaName.L,
-		InspectionSchemaName.L,
 		PerformanceSchemaName.L,
 		mysql.SystemDB,
 		MetricSchemaName.L:
@@ -301,11 +331,146 @@ func TLSCipher2String(n uint16) string {
 	return s
 }
 
+// ColumnsToProto converts a slice of model.ColumnInfo to a slice of tipb.ColumnInfo.
+func ColumnsToProto(columns []*model.ColumnInfo, pkIsHandle bool) []*tipb.ColumnInfo {
+	cols := make([]*tipb.ColumnInfo, 0, len(columns))
+	for _, c := range columns {
+		col := ColumnToProto(c)
+		// TODO: Here `PkHandle`'s meaning is changed, we will change it to `IsHandle` when tikv's old select logic
+		// is abandoned.
+		if (pkIsHandle && mysql.HasPriKeyFlag(c.Flag)) || c.ID == model.ExtraHandleID {
+			col.PkHandle = true
+		} else {
+			col.PkHandle = false
+		}
+		cols = append(cols, col)
+	}
+	return cols
+}
+
+// ColumnToProto converts model.ColumnInfo to tipb.ColumnInfo.
+func ColumnToProto(c *model.ColumnInfo) *tipb.ColumnInfo {
+	pc := &tipb.ColumnInfo{
+		ColumnId:  c.ID,
+		Collation: collate.RewriteNewCollationIDIfNeeded(int32(mysql.CollationNames[c.FieldType.Collate])),
+		ColumnLen: int32(c.FieldType.Flen),
+		Decimal:   int32(c.FieldType.Decimal),
+		Flag:      int32(c.Flag),
+		Elems:     c.Elems,
+	}
+	pc.Tp = int32(c.FieldType.Tp)
+	return pc
+}
+
 func init() {
 	for _, value := range tlsCipherString {
 		SupportCipher[value] = struct{}{}
 	}
 	for key, value := range pkixAttributeTypeNames {
 		pkixTypeNameAttributes[value] = key
+	}
+}
+
+// SequenceSchema is implemented by infoSchema and used by sequence function in expression package.
+// Otherwise calling information schema will cause import cycle problem.
+type SequenceSchema interface {
+	SequenceByName(schema, sequence model.CIStr) (SequenceTable, error)
+}
+
+// SequenceTable is implemented by tableCommon, and it is specialised in handling sequence operation.
+// Otherwise calling table will cause import cycle problem.
+type SequenceTable interface {
+	GetSequenceID() int64
+	GetSequenceNextVal(ctx interface{}, dbName, seqName string) (int64, error)
+	SetSequenceVal(ctx interface{}, newVal int64, dbName, seqName string) (int64, bool, error)
+}
+
+// LoadTLSCertificates loads CA/KEY/CERT for special paths.
+func LoadTLSCertificates(ca, key, cert string) (tlsConfig *tls.Config, err error) {
+	if len(cert) == 0 || len(key) == 0 {
+		return
+	}
+
+	var tlsCert tls.Certificate
+	tlsCert, err = tls.LoadX509KeyPair(cert, key)
+	if err != nil {
+		logutil.BgLogger().Warn("load x509 failed", zap.Error(err))
+		err = errors.Trace(err)
+		return
+	}
+
+	requireTLS := config.GetGlobalConfig().Security.RequireSecureTransport
+
+	// Try loading CA cert.
+	clientAuthPolicy := tls.NoClientCert
+	if requireTLS {
+		clientAuthPolicy = tls.RequestClientCert
+	}
+	var certPool *x509.CertPool
+	if len(ca) > 0 {
+		var caCert []byte
+		caCert, err = ioutil.ReadFile(ca)
+		if err != nil {
+			logutil.BgLogger().Warn("read file failed", zap.Error(err))
+			err = errors.Trace(err)
+			return
+		}
+		certPool = x509.NewCertPool()
+		if certPool.AppendCertsFromPEM(caCert) {
+			if requireTLS {
+				clientAuthPolicy = tls.RequireAndVerifyClientCert
+			} else {
+				clientAuthPolicy = tls.VerifyClientCertIfGiven
+			}
+		}
+	}
+	tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{tlsCert},
+		ClientCAs:    certPool,
+		ClientAuth:   clientAuthPolicy,
+	}
+	return
+}
+
+// IsTLSExpiredError checks error is caused by TLS expired.
+func IsTLSExpiredError(err error) bool {
+	err = errors.Cause(err)
+	if inval, ok := err.(x509.CertificateInvalidError); !ok || inval.Reason != x509.Expired {
+		return false
+	}
+	return true
+}
+
+var (
+	internalClientInit sync.Once
+	internalHTTPClient *http.Client
+	internalHTTPSchema string
+)
+
+// InternalHTTPClient is used by TiDB-Server to request other components.
+func InternalHTTPClient() *http.Client {
+	internalClientInit.Do(initInternalClient)
+	return internalHTTPClient
+}
+
+// InternalHTTPSchema specifies use http or https to request other components.
+func InternalHTTPSchema() string {
+	internalClientInit.Do(initInternalClient)
+	return internalHTTPSchema
+}
+
+func initInternalClient() {
+	tlsCfg, err := config.GetGlobalConfig().Security.ToTLSConfig()
+	if err != nil {
+		logutil.BgLogger().Fatal("could not load cluster ssl", zap.Error(err))
+	}
+	if tlsCfg == nil {
+		internalHTTPSchema = "http"
+		internalHTTPClient = http.DefaultClient
+		return
+	}
+	internalHTTPSchema = "https"
+	internalHTTPClient = &http.Client{
+		Transport: &http.Transport{TLSClientConfig: tlsCfg},
 	}
 }

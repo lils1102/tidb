@@ -17,16 +17,15 @@ import (
 	"context"
 	"fmt"
 	"math"
-	"math/rand"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/pingcap/errors"
 	"github.com/pingcap/log"
-	"github.com/pingcap/parser/mysql"
-	"github.com/pingcap/parser/terror"
 	"github.com/pingcap/tidb/kv"
 	"github.com/pingcap/tidb/metrics"
+	"github.com/pingcap/tidb/util/fastrand"
 	"github.com/pingcap/tidb/util/logutil"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
@@ -52,6 +51,7 @@ var (
 	tikvBackoffHistogramRegionMiss   = metrics.TiKVBackoffHistogram.WithLabelValues("regionMiss")
 	tikvBackoffHistogramUpdateLeader = metrics.TiKVBackoffHistogram.WithLabelValues("updateLeader")
 	tikvBackoffHistogramServerBusy   = metrics.TiKVBackoffHistogram.WithLabelValues("serverBusy")
+	tikvBackoffHistogramStaleCmd     = metrics.TiKVBackoffHistogram.WithLabelValues("staleCommand")
 	tikvBackoffHistogramEmpty        = metrics.TiKVBackoffHistogram.WithLabelValues("")
 )
 
@@ -71,6 +71,8 @@ func (t backoffType) metric() prometheus.Observer {
 		return tikvBackoffHistogramUpdateLeader
 	case boServerBusy:
 		return tikvBackoffHistogramServerBusy
+	case boStaleCmd:
+		return tikvBackoffHistogramStaleCmd
 	}
 	return tikvBackoffHistogramEmpty
 }
@@ -92,12 +94,12 @@ func NewBackoffFn(base, cap, jitter int) func(ctx context.Context, maxSleepMs in
 			sleep = expo(base, cap, attempts)
 		case FullJitter:
 			v := expo(base, cap, attempts)
-			sleep = rand.Intn(v)
+			sleep = int(fastrand.Uint32N(uint32(v)))
 		case EqualJitter:
 			v := expo(base, cap, attempts)
-			sleep = v/2 + rand.Intn(v/2)
+			sleep = v/2 + int(fastrand.Uint32N(uint32(v/2)))
 		case DecorrJitter:
-			sleep = int(math.Min(float64(cap), float64(base+rand.Intn(lastSleep*3-base))))
+			sleep = int(math.Min(float64(cap), float64(base+int(fastrand.Uint32N(uint32(lastSleep*3-base))))))
 		}
 		logutil.BgLogger().Debug("backoff",
 			zap.Int("base", base),
@@ -135,6 +137,7 @@ const (
 	BoUpdateLeader
 	boServerBusy
 	boTxnNotFound
+	boStaleCmd
 )
 
 func (t backoffType) createFn(vars *kv.Variables) func(context.Context, int) int {
@@ -159,6 +162,8 @@ func (t backoffType) createFn(vars *kv.Variables) func(context.Context, int) int
 		return NewBackoffFn(1, 10, NoJitter)
 	case boServerBusy:
 		return NewBackoffFn(2000, 10000, EqualJitter)
+	case boStaleCmd:
+		return NewBackoffFn(2, 1000, NoJitter)
 	}
 	return nil
 }
@@ -179,6 +184,8 @@ func (t backoffType) String() string {
 		return "updateLeader"
 	case boServerBusy:
 		return "serverBusy"
+	case boStaleCmd:
+		return "staleCommand"
 	case boTxnNotFound:
 		return "txnNotFound"
 	}
@@ -197,8 +204,10 @@ func (t backoffType) TError() error {
 		return ErrRegionUnavailable
 	case boServerBusy:
 		return ErrTiKVServerBusy
+	case boStaleCmd:
+		return ErrTiKVStaleCommand
 	}
-	return terror.ClassTiKV.New(mysql.ErrUnknown, mysql.MySQLErrName[mysql.ErrUnknown])
+	return ErrUnknown
 }
 
 // Maximum total sleep time(in ms) for kv/cop commands.
@@ -219,8 +228,8 @@ const (
 	scatterRegionBackoff           = 20000
 	waitScatterRegionFinishBackoff = 120000
 	locateRegionMaxBackoff         = 20000
-	pessimisticLockMaxBackoff      = 10000
-	pessimisticRollbackMaxBackoff  = 10000
+	pessimisticLockMaxBackoff      = 20000
+	pessimisticRollbackMaxBackoff  = 20000
 )
 
 var (
@@ -334,11 +343,17 @@ func (b *Backoffer) BackoffWithMaxSleep(typ backoffType, maxSleepMs int, err err
 	}
 	b.backoffTimes[typ]++
 
+	if b.vars != nil && b.vars.Killed != nil {
+		if atomic.CompareAndSwapUint32(b.vars.Killed, 1, 0) {
+			return ErrQueryInterrupted
+		}
+	}
+
 	var startTs interface{}
 	if ts := b.ctx.Value(txnStartKey); ts != nil {
 		startTs = ts
 	}
-	logutil.BgLogger().Debug("retry later",
+	logutil.Logger(b.ctx).Debug("retry later",
 		zap.Error(err),
 		zap.Int("totalSleep", b.totalSleep),
 		zap.Int("maxSleep", b.maxSleep),

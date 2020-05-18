@@ -56,7 +56,7 @@ func (v *coprCacheValue) Len() int {
 }
 
 func newCoprCache(config *config.CoprocessorCache) (*coprCache, error) {
-	if config == nil || !config.Enabled {
+	if config == nil || !config.Enable {
 		return nil, nil
 	}
 	capacityInBytes := int64(config.CapacityMB * 1024.0 * 1024.0)
@@ -152,7 +152,7 @@ func (c *coprCache) Get(key []byte) *coprCacheValue {
 	}
 	typedValue := value.(*coprCacheValue)
 	// ristretto does not handle hash collision, so check the key equality after getting a value.
-	if bytes.Compare(typedValue.Key, key) != 0 {
+	if !bytes.Equal(typedValue.Key, key) {
 		return nil
 	}
 	return typedValue
